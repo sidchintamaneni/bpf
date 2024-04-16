@@ -1429,6 +1429,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	}
 	dst_state->speculative = src->speculative;
 	dst_state->active_rcu_lock = src->active_rcu_lock;
+	dst_state->in_sleepable = src->in_sleepable;
 	dst_state->curframe = src->curframe;
 	dst_state->active_lock.ptr = src->active_lock.ptr;
 	dst_state->active_lock.id = src->active_lock.id;
@@ -2404,7 +2405,7 @@ static void init_func_state(struct bpf_verifier_env *env,
 /* Similar to push_stack(), but for async callbacks */
 static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 						int insn_idx, int prev_insn_idx,
-						int subprog)
+						int subprog, bool is_sleepable)
 {
 	struct bpf_verifier_stack_elem *elem;
 	struct bpf_func_state *frame;
@@ -2431,6 +2432,7 @@ static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 	 * Initialize it similar to do_check_common().
 	 */
 	elem->st.branches = 1;
+	elem->st.in_sleepable = is_sleepable;
 	frame = kzalloc(sizeof(*frame), GFP_KERNEL);
 	if (!frame)
 		goto err;
@@ -5278,7 +5280,8 @@ bad_type:
 
 static bool in_sleepable(struct bpf_verifier_env *env)
 {
-	return env->prog->sleepable;
+	return env->prog->sleepable ||
+	       (env->cur_state && env->cur_state->in_sleepable);
 }
 
 /* The non-sleepable programs and sleepable programs with explicit bpf_rcu_read_lock()
@@ -9515,7 +9518,7 @@ static int btf_check_subprog_call(struct bpf_verifier_env *env, int subprog,
 }
 
 static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			      int insn_idx, int subprog,
+			      int insn_idx, int subprog, bool is_sleepable,
 			      set_callee_state_fn set_callee_state_cb)
 {
 	struct bpf_verifier_state *state = env->cur_state, *callback_state;
@@ -9550,7 +9553,7 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 		/* there is no real recursion here. timer callbacks are async */
 		env->subprog_info[subprog].is_async_cb = true;
 		async_cb = push_async_cb(env, env->subprog_info[subprog].start,
-					 insn_idx, subprog);
+					 insn_idx, subprog, is_sleepable);
 		if (!async_cb)
 			return -EFAULT;
 		callee = async_cb->frame[0];
@@ -10389,15 +10392,15 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		}
 		break;
 	case BPF_FUNC_for_each_map_elem:
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno, false,
 					 set_map_elem_callback_state);
 		break;
 	case BPF_FUNC_timer_set_callback:
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno, false,
 					 set_timer_callback_state);
 		break;
 	case BPF_FUNC_find_vma:
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno, false,
 					 set_find_vma_callback_state);
 		break;
 	case BPF_FUNC_snprintf:
@@ -10412,7 +10415,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		if (err)
 			return err;
 		if (cur_func(env)->callback_depth < regs[BPF_REG_1].umax_value) {
-			err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+			err = push_callback_call(env, insn, insn_idx, meta.subprogno, false,
 						 set_loop_callback_state);
 		} else {
 			cur_func(env)->callback_depth = 0;
@@ -10515,7 +10518,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		break;
 	}
 	case BPF_FUNC_user_ringbuf_drain:
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno, false,
 					 set_user_ringbuf_callback_state);
 		break;
 	}
@@ -12232,7 +12235,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_rbtree_add_impl]) {
-		err = push_callback_call(env, insn, insn_idx, meta.subprogno,
+		err = push_callback_call(env, insn, insn_idx, meta.subprogno, false,
 					 set_rbtree_add_callback_state);
 		if (err) {
 			verbose(env, "kfunc %s#%d failed callback verification\n",
@@ -16988,6 +16991,9 @@ static bool states_equal(struct bpf_verifier_env *env,
 		return false;
 
 	if (old->active_rcu_lock != cur->active_rcu_lock)
+		return false;
+
+	if (old->in_sleepable != cur->in_sleepable)
 		return false;
 
 	/* for states to be equal callsites have to be the same
