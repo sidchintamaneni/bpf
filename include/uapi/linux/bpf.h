@@ -7502,4 +7502,13 @@ struct bpf_iter_num {
 	__u64 __opaque[1];
 } __attribute__((aligned(8)));
 
+/*
+ * Flags to control bpf_wq_init() and bpf_wq_set_callback() behaviour.
+ *     - BPF_F_WQ_SLEEPABLE: the callback needs to run in
+ *       a sleepable context
+ */
+enum {
+	BPF_F_WQ_SLEEPABLE = (1ULL << 0),
+};
+
 #endif /* _UAPI__LINUX_BPF_H__ */
