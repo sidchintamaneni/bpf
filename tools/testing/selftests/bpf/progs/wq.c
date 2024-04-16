@@ -49,12 +49,21 @@ struct {
 	__type(value, struct elem);
 } lru SEC(".maps");
 
+#define CLOCK_MONOTONIC 1
+
+__u32 ok;
+__u32 ok_sleepable;
+
 static int test_elem_callback(void *map, int *key,
 		int (callback_fn)(void *map, int *key, struct bpf_wq *wq),
 		u64 callback_flags)
 {
 	struct elem init = {}, *val;
 	struct bpf_wq *wq;
+
+	if ((ok & (1 << *key) ||
+	    (ok_sleepable & (1 << *key))))
+		return -22;
 
 	if (map == &lru &&
 	    bpf_map_update_elem(map, key, &init, 0))
@@ -71,6 +80,9 @@ static int test_elem_callback(void *map, int *key,
 	if (bpf_wq_set_callback(wq, callback_fn, callback_flags))
 		return -4;
 
+	if (bpf_wq_start(wq, 0))
+		return -5;
+
 	return 0;
 }
 
@@ -80,6 +92,10 @@ static int test_hmap_elem_callback(void *map, int *key,
 {
 	struct hmap_elem init = {}, *val;
 	struct bpf_wq *wq;
+
+	if ((ok & (1 << *key) ||
+	    (ok_sleepable & (1 << *key))))
+		return -22;
 
 	if (bpf_map_update_elem(map, key, &init, 0))
 		return -1;
@@ -95,11 +111,11 @@ static int test_hmap_elem_callback(void *map, int *key,
 	if (bpf_wq_set_callback(wq, callback_fn, callback_flags))
 		return -4;
 
+	if (bpf_wq_start(wq, 0))
+		return -5;
+
 	return 0;
 }
-
-__u32 ok;
-__u32 ok_sleepable;
 
 /* callback for non sleepable workqueue */
 static int wq_callback(void *map, int *key, struct bpf_wq *work)
