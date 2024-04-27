@@ -13,11 +13,14 @@
 #define QUEUE_STACK_CREATE_FLAG_MASK \
 	(BPF_F_NUMA_NODE | BPF_F_ACCESS_MASK)
 
+#define KERNEL_PATCH 1
+
 struct bpf_queue_stack {
 	struct bpf_map map;
 	raw_spinlock_t lock;
 	u32 head, tail;
 	u32 size; /* max_entries + 1 */
+	int __percpu *map_locked;
 
 	char elements[] __aligned(8);
 };
@@ -78,6 +81,17 @@ static struct bpf_map *queue_stack_map_alloc(union bpf_attr *attr)
 
 	qs->size = size;
 
+#if KERNEL_PATCH
+	qs->map_locked = bpf_map_alloc_percpu(&qs->map,
+						sizeof(int),
+						sizeof(int),
+						GFP_USER);
+	if (!qs->map_locked){
+		bpf_map_area_free(qs);
+		return ERR_PTR(-ENOMEM);
+	}
+#endif
+
 	raw_spin_lock_init(&qs->lock);
 
 	return &qs->map;
@@ -88,6 +102,7 @@ static void queue_stack_map_free(struct bpf_map *map)
 {
 	struct bpf_queue_stack *qs = bpf_queue_stack(map);
 
+	free_percpu(qs->map_locked);
 	bpf_map_area_free(qs);
 }
 
@@ -98,6 +113,15 @@ static long __queue_map_get(struct bpf_map *map, void *value, bool delete)
 	int err = 0;
 	void *ptr;
 
+	/* Preventing nested Maps from deadlock if they acquires
+	 * the same map object */
+	// should I disable pre-emption and interrupts
+#if KERNEL_PATCH
+	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
+		__this_cpu_dec(*(qs->map_locked));
+		return -EBUSY;
+	}
+#endif
 	if (in_nmi()) {
 		if (!raw_spin_trylock_irqsave(&qs->lock, flags))
 			return -EBUSY;
@@ -132,6 +156,13 @@ static long __stack_map_get(struct bpf_map *map, void *value, bool delete)
 	int err = 0;
 	void *ptr;
 	u32 index;
+
+#if KERNEL_PATCH
+	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
+		__this_cpu_dec(*(qs->map_locked));
+		return -EBUSY;
+	}
+#endif
 
 	if (in_nmi()) {
 		if (!raw_spin_trylock_irqsave(&qs->lock, flags))
@@ -194,6 +225,12 @@ static long queue_stack_map_push_elem(struct bpf_map *map, void *value,
 	int err = 0;
 	void *dst;
 
+#if KERNEL_PATCH
+	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
+		__this_cpu_dec(*(qs->map_locked));
+		return -EBUSY;
+	}
+#endif
 	/* BPF_EXIST is used to force making room for a new element in case the
 	 * map is full
 	 */
