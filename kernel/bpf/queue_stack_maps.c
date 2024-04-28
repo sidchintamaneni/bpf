@@ -116,9 +116,9 @@ static long __queue_map_get(struct bpf_map *map, void *value, bool delete)
 	/* Preventing nested Maps from deadlock if they acquires
 	 * the same map object */
 	// should I disable pre-emption and interrupts
+#if KERNEL_PATCH
 	preempt_disable();
 	local_irq_save(flags);
-#if KERNEL_PATCH
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
 		local_irq_restore(flags);
@@ -162,9 +162,9 @@ static long __stack_map_get(struct bpf_map *map, void *value, bool delete)
 	void *ptr;
 	u32 index;
 
+#if KERNEL_PATCH
 	preempt_disable();
 	local_irq_save(flags);
-#if KERNEL_PATCH
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
 		local_irq_restore(flags);
@@ -239,6 +239,8 @@ static long queue_stack_map_push_elem(struct bpf_map *map, void *value,
 	preempt_disable();
 	local_irq_save(irq_flags);
 #if KERNEL_PATCH
+	preempt_disable();
+	local_irq_save(flags);
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
 		local_irq_restore(irq_flags);
