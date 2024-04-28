@@ -10,11 +10,8 @@ static void test_map_queue_stack_nesting_success(bool is_map_queue)
 	int err;
 	int prog_fd;
 
-	LIBBPF_OPTS(bpf_test_run_opts, ropts,
-		.data_in = &pkt_v4,
-		.data_size_in = sizeof(pkt_v4),
-		.repeat = 1,
-	);
+	LIBBPF_OPTS(bpf_test_run_opts, ropts);
+
 	skel = test_queue_stack_nested_map__open_and_load();
 	if(!ASSERT_OK_PTR(skel, "test_queue_stack_nested_map__open_and_load"))
 		goto out;

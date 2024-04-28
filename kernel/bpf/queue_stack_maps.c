@@ -13,7 +13,7 @@
 #define QUEUE_STACK_CREATE_FLAG_MASK \
 	(BPF_F_NUMA_NODE | BPF_F_ACCESS_MASK)
 
-#define KERNEL_PATCH 0
+#define KERNEL_PATCH 1
 
 struct bpf_queue_stack {
 	struct bpf_map map;
@@ -235,12 +235,9 @@ static long queue_stack_map_push_elem(struct bpf_map *map, void *value,
 	int err = 0;
 	void *dst;
 
-
-	preempt_disable();
-	local_irq_save(irq_flags);
 #if KERNEL_PATCH
 	preempt_disable();
-	local_irq_save(flags);
+	local_irq_save(irq_flags);
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
 		local_irq_restore(irq_flags);
