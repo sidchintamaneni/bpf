@@ -13,7 +13,7 @@
 #define QUEUE_STACK_CREATE_FLAG_MASK \
 	(BPF_F_NUMA_NODE | BPF_F_ACCESS_MASK)
 
-#define KERNEL_PATCH 1
+#define KERNEL_PATCH 0
 
 struct bpf_queue_stack {
 	struct bpf_map map;
@@ -116,11 +116,16 @@ static long __queue_map_get(struct bpf_map *map, void *value, bool delete)
 	/* Preventing nested Maps from deadlock if they acquires
 	 * the same map object */
 	// should I disable pre-emption and interrupts
+	preempt_disable();
+	local_irq_save(flags);
 #if KERNEL_PATCH
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
+		local_irq_restore(flags);
+		preempt_enable();
 		return -EBUSY;
 	}
+	preempt_enable();
 #endif
 	if (in_nmi()) {
 		if (!raw_spin_trylock_irqsave(&qs->lock, flags))
@@ -157,11 +162,16 @@ static long __stack_map_get(struct bpf_map *map, void *value, bool delete)
 	void *ptr;
 	u32 index;
 
+	preempt_disable();
+	local_irq_save(flags);
 #if KERNEL_PATCH
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
+		local_irq_restore(flags);
+		preempt_enable();
 		return -EBUSY;
 	}
+	preempt_enable();
 #endif
 
 	if (in_nmi()) {
@@ -225,11 +235,17 @@ static long queue_stack_map_push_elem(struct bpf_map *map, void *value,
 	int err = 0;
 	void *dst;
 
+
+	preempt_disable();
+	local_irq_save(irq_flags);
 #if KERNEL_PATCH
 	if(unlikely(__this_cpu_inc_return(*(qs->map_locked)) != 1)){
 		__this_cpu_dec(*(qs->map_locked));
+		local_irq_restore(irq_flags);
+		preempt_enable();
 		return -EBUSY;
 	}
+	preempt_enable();
 #endif
 	/* BPF_EXIST is used to force making room for a new element in case the
 	 * map is full
