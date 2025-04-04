@@ -57,6 +57,7 @@ struct cgroup;
 struct bpf_token;
 struct user_namespace;
 struct super_block;
+struct termination_aux_states;
 struct inode;
 
 extern struct idr btf_idr;
@@ -1518,6 +1519,12 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct termination_aux_states {
+	int __percpu *cpu_id;
+	struct pt_regs __percpu *pre_execution_state;
+	struct bpf_prog *termination_prog;
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1656,6 +1663,7 @@ struct bpf_prog {
 					    const struct bpf_insn *insn);
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+	struct termination_aux_states *termination_states;
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
@@ -3392,6 +3400,9 @@ extern const struct bpf_func_proto bpf_get_retval_proto;
 extern const struct bpf_func_proto bpf_user_ringbuf_drain_proto;
 extern const struct bpf_func_proto bpf_cgrp_storage_get_proto;
 extern const struct bpf_func_proto bpf_cgrp_storage_delete_proto;
+extern const struct bpf_func_proto bpf_dummy_void_proto;
+extern const struct bpf_func_proto bpf_dummy_int_proto;
+extern const struct bpf_func_proto bpf_dummy_ptr_to_map_proto;
 
 const struct bpf_func_proto *tracing_prog_func_proto(
   enum bpf_func_id func_id, const struct bpf_prog *prog);
