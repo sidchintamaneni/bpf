@@ -226,6 +226,22 @@ BPF_CALL_0(bpf_get_current_pid_tgid)
 	if (unlikely(!task))
 		return -EINVAL;
 
+	int x = 0;
+
+	for (int i = 0; i < 10000000; i++) {
+		for (int j = 0; j < 1000000; j++) {
+			for (int k = 0; k < 1000000; k++) {
+				if ( i%2==0 && j%2==0 )
+					x++;
+				else
+					x--;
+			}	
+		}
+	}
+
+	if (x == 0)
+		task = NULL;
+
 	return (u64) task->tgid << 32 | task->pid;
 }
 

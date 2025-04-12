@@ -689,6 +689,7 @@ extern int (*nfct_btf_struct_access)(struct bpf_verifier_log *log,
 				     const struct bpf_reg_state *reg,
 				     int off, int size);
 
+void bpf_die(void *data);
 typedef unsigned int (*bpf_dispatcher_fn)(const void *ctx,
 					  const struct bpf_insn *insnsi,
 					  unsigned int (*bpf_func)(const void *,
@@ -699,8 +700,16 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 					  bpf_dispatcher_fn dfunc)
 {
 	u32 ret;
+	unsigned long flags;
 
 	cant_migrate();
+	
+	int cpu_id = raw_smp_processor_id();
+	spin_lock_irqsave(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
+	prog->termination_states->per_cpu_state[cpu_id].cpu_id = 1;
+	spin_unlock_irqrestore(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
 		struct bpf_prog_stats *stats;
 		u64 duration, start = sched_clock();
@@ -717,6 +726,11 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 	} else {
 		ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
 	}
+	spin_lock_irqsave(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
+	prog->termination_states->per_cpu_state[cpu_id].cpu_id = 0;
+	spin_unlock_irqrestore(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
 	return ret;
 }
 

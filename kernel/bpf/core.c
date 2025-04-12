@@ -99,7 +99,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	gfp_t gfp_flags = bpf_memcg_flags(GFP_KERNEL | __GFP_ZERO | gfp_extra_flags);
 	struct bpf_prog_aux *aux;
 	struct bpf_prog *fp;
-	struct termination_aux_states *termination_states;
+	struct termination_aux_states *termination_states = NULL;
 
 	size = round_up(size, __PAGE_SIZE);
 	fp = __vmalloc(size, gfp_flags);
@@ -118,14 +118,38 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 		return NULL;
 	}
 
-	termination_states = kzalloc(sizeof(*termination_states), bpf_memcg_flags(GFP_KERNEL | gfp_extra_flags));
+	termination_states = kzalloc(sizeof(*termination_states),
+			bpf_memcg_flags(GFP_KERNEL | gfp_extra_flags));
 	if (termination_states == NULL) {
+		free_percpu(fp->active);
 		vfree(fp);
 		kfree(aux);
 		return NULL;
-	} else {
-		termination_states->cpu_id = alloc_percpu(int);
-		termination_states->pre_execution_state = alloc_percpu(struct pt_regs);
+	}
+
+	termination_states->per_cpu_state =
+		kzalloc(sizeof(struct cpu_aux) * NR_CPUS,
+				bpf_memcg_flags(GFP_KERNEL | gfp_extra_flags));
+	if (termination_states->per_cpu_state == NULL) {
+		vfree(fp);
+		kfree(aux);
+		return NULL;
+	}
+	for (int i = 0; i < NR_CPUS; i++) {
+		termination_states->per_cpu_state[i].cpu_id = 0;	
+		spin_lock_init(&termination_states->per_cpu_state[i].lock);
+	}
+
+	termination_states->pre_execution_state = kzalloc(sizeof(struct
+				pt_regs) * NR_CPUS, bpf_memcg_flags(GFP_KERNEL
+					| gfp_extra_flags));
+	if (termination_states->pre_execution_state == NULL) {
+		kfree(termination_states->per_cpu_state);
+		kfree(termination_states);
+		free_percpu(fp->active);
+		vfree(fp);
+		kfree(aux);
+		return NULL;
 	}
 
 	fp->pages = size / PAGE_SIZE;
@@ -296,8 +320,8 @@ void __bpf_prog_free(struct bpf_prog *fp)
 	}
 
 	if (fp->termination_states) {
-		free_percpu(fp->termination_states->cpu_id);
-		free_percpu(fp->termination_states->pre_execution_state);
+		kfree(fp->termination_states->pre_execution_state);
+		kfree(fp->termination_states->per_cpu_state);
 		kfree(fp->termination_states);
 	}
 

@@ -1519,9 +1519,16 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct cpu_aux {
+	u8 cpu_id;
+	// is spinlock a right choice here?
+	// explain reasoning to Raj
+	spinlock_t lock; // protect cpu_id
+};
+
 struct termination_aux_states {
-	int __percpu *cpu_id;
-	struct pt_regs __percpu *pre_execution_state;
+	struct cpu_aux *per_cpu_state;
+	struct pt_regs *pre_execution_state;
 	struct bpf_prog *termination_prog;
 };
 

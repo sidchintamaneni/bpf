@@ -961,6 +961,7 @@ enum bpf_cmd {
 	BPF_LINK_DETACH,
 	BPF_PROG_BIND_MAP,
 	BPF_TOKEN_CREATE,
+	BPF_PROG_TERMINATE,
 	__MAX_BPF_CMD,
 };
 
@@ -1841,6 +1842,11 @@ union bpf_attr {
 		__u32		flags;
 		__u32		bpffs_fd;
 	} token_create;
+
+	struct { /* struct used by BPF_PROG_TERMINATE */
+		__u32		prog_id;
+		__u32		term_cpu_id;
+	} prog_terminate;
 
 } __attribute__((aligned(8)));
 
@@ -6027,6 +6033,10 @@ union bpf_attr {
 	FN(dummy_void, 212, ##ctx)			\
 	FN(dummy_int, 213, ##ctx)			\
 	FN(dummy_ptr_to_map, 214, ##ctx)		\
+	/*
+	 * TODO: Remove these dummy helper interface because we
+	 * are not exposing them to userspace
+	 */
 	/* This helper list is effectively frozen. If you are trying to	\
 	 * add a new helper, you should add a kfunc instead which has	\
 	 * less stability guarantees. See Documentation/bpf/kfuncs.rst	\

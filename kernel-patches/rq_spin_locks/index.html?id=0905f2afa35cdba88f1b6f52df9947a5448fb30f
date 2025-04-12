@@ -1,0 +1,5395 @@
+From 8707d1eedcfbe85c4ff5191e233ddff01d39f4ba Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:17 -0700
+Subject: locking: Move MCS struct definition to public header
+
+Move the definition of the struct mcs_spinlock from the private
+mcs_spinlock.h header in kernel/locking to the mcs_spinlock.h
+asm-generic header, since we will need to reference it from the
+qspinlock.h header in subsequent commits.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-2-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/mcs_spinlock.h | 6 ++++++
+ kernel/locking/mcs_spinlock.h      | 6 ------
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/include/asm-generic/mcs_spinlock.h b/include/asm-generic/mcs_spinlock.h
+index 10cd4ffc6ba295..39c94012b88a8d 100644
+--- a/include/asm-generic/mcs_spinlock.h
++++ b/include/asm-generic/mcs_spinlock.h
+@@ -1,6 +1,12 @@
+ #ifndef __ASM_MCS_SPINLOCK_H
+ #define __ASM_MCS_SPINLOCK_H
+ 
++struct mcs_spinlock {
++	struct mcs_spinlock *next;
++	int locked; /* 1 if lock acquired */
++	int count;  /* nesting count, see qspinlock.c */
++};
++
+ /*
+  * Architectures can define their own:
+  *
+diff --git a/kernel/locking/mcs_spinlock.h b/kernel/locking/mcs_spinlock.h
+index 85251d8771d919..16160ca8907fbc 100644
+--- a/kernel/locking/mcs_spinlock.h
++++ b/kernel/locking/mcs_spinlock.h
+@@ -15,12 +15,6 @@
+ 
+ #include <asm/mcs_spinlock.h>
+ 
+-struct mcs_spinlock {
+-	struct mcs_spinlock *next;
+-	int locked; /* 1 if lock acquired */
+-	int count;  /* nesting count, see qspinlock.c */
+-};
+-
+ #ifndef arch_mcs_spin_lock_contended
+ /*
+  * Using smp_cond_load_acquire() provides the acquire semantics
+-- 
+cgit 1.2.3-korg
+
+
+From ac08f68f1fe32326fbe60a02f9ff5f6749a35ab8 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:18 -0700
+Subject: locking: Move common qspinlock helpers to a private header
+
+Move qspinlock helper functions that encode, decode tail word, set and
+clear the pending and locked bits, and other miscellaneous definitions
+and macros to a private header. To this end, create a qspinlock.h header
+file in kernel/locking. Subsequent commits will introduce a modified
+qspinlock slow path function, thus moving shared code to a private
+header will help minimize unnecessary code duplication.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-3-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/locking/qspinlock.c | 193 ++-----------------------------------------
+ kernel/locking/qspinlock.h | 201 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 206 insertions(+), 188 deletions(-)
+ create mode 100644 kernel/locking/qspinlock.h
+
+diff --git a/kernel/locking/qspinlock.c b/kernel/locking/qspinlock.c
+index 7d96bed718e42a..af8d122bb649e6 100644
+--- a/kernel/locking/qspinlock.c
++++ b/kernel/locking/qspinlock.c
+@@ -25,8 +25,9 @@
+ #include <trace/events/lock.h>
+ 
+ /*
+- * Include queued spinlock statistics code
++ * Include queued spinlock definitions and statistics code
+  */
++#include "qspinlock.h"
+ #include "qspinlock_stat.h"
+ 
+ /*
+@@ -67,36 +68,6 @@
+  */
+ 
+ #include "mcs_spinlock.h"
+-#define MAX_NODES	4
+-
+-/*
+- * On 64-bit architectures, the mcs_spinlock structure will be 16 bytes in
+- * size and four of them will fit nicely in one 64-byte cacheline. For
+- * pvqspinlock, however, we need more space for extra data. To accommodate
+- * that, we insert two more long words to pad it up to 32 bytes. IOW, only
+- * two of them can fit in a cacheline in this case. That is OK as it is rare
+- * to have more than 2 levels of slowpath nesting in actual use. We don't
+- * want to penalize pvqspinlocks to optimize for a rare case in native
+- * qspinlocks.
+- */
+-struct qnode {
+-	struct mcs_spinlock mcs;
+-#ifdef CONFIG_PARAVIRT_SPINLOCKS
+-	long reserved[2];
+-#endif
+-};
+-
+-/*
+- * The pending bit spinning loop count.
+- * This heuristic is used to limit the number of lockword accesses
+- * made by atomic_cond_read_relaxed when waiting for the lock to
+- * transition out of the "== _Q_PENDING_VAL" state. We don't spin
+- * indefinitely because there's no guarantee that we'll make forward
+- * progress.
+- */
+-#ifndef _Q_PENDING_LOOPS
+-#define _Q_PENDING_LOOPS	1
+-#endif
+ 
+ /*
+  * Per-CPU queue node structures; we can never have more than 4 nested
+@@ -106,161 +77,7 @@ struct qnode {
+  *
+  * PV doubles the storage and uses the second cacheline for PV state.
+  */
+-static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[MAX_NODES]);
+-
+-/*
+- * We must be able to distinguish between no-tail and the tail at 0:0,
+- * therefore increment the cpu number by one.
+- */
+-
+-static inline __pure u32 encode_tail(int cpu, int idx)
+-{
+-	u32 tail;
+-
+-	tail  = (cpu + 1) << _Q_TAIL_CPU_OFFSET;
+-	tail |= idx << _Q_TAIL_IDX_OFFSET; /* assume < 4 */
+-
+-	return tail;
+-}
+-
+-static inline __pure struct mcs_spinlock *decode_tail(u32 tail)
+-{
+-	int cpu = (tail >> _Q_TAIL_CPU_OFFSET) - 1;
+-	int idx = (tail &  _Q_TAIL_IDX_MASK) >> _Q_TAIL_IDX_OFFSET;
+-
+-	return per_cpu_ptr(&qnodes[idx].mcs, cpu);
+-}
+-
+-static inline __pure
+-struct mcs_spinlock *grab_mcs_node(struct mcs_spinlock *base, int idx)
+-{
+-	return &((struct qnode *)base + idx)->mcs;
+-}
+-
+-#define _Q_LOCKED_PENDING_MASK (_Q_LOCKED_MASK | _Q_PENDING_MASK)
+-
+-#if _Q_PENDING_BITS == 8
+-/**
+- * clear_pending - clear the pending bit.
+- * @lock: Pointer to queued spinlock structure
+- *
+- * *,1,* -> *,0,*
+- */
+-static __always_inline void clear_pending(struct qspinlock *lock)
+-{
+-	WRITE_ONCE(lock->pending, 0);
+-}
+-
+-/**
+- * clear_pending_set_locked - take ownership and clear the pending bit.
+- * @lock: Pointer to queued spinlock structure
+- *
+- * *,1,0 -> *,0,1
+- *
+- * Lock stealing is not allowed if this function is used.
+- */
+-static __always_inline void clear_pending_set_locked(struct qspinlock *lock)
+-{
+-	WRITE_ONCE(lock->locked_pending, _Q_LOCKED_VAL);
+-}
+-
+-/*
+- * xchg_tail - Put in the new queue tail code word & retrieve previous one
+- * @lock : Pointer to queued spinlock structure
+- * @tail : The new queue tail code word
+- * Return: The previous queue tail code word
+- *
+- * xchg(lock, tail), which heads an address dependency
+- *
+- * p,*,* -> n,*,* ; prev = xchg(lock, node)
+- */
+-static __always_inline u32 xchg_tail(struct qspinlock *lock, u32 tail)
+-{
+-	/*
+-	 * We can use relaxed semantics since the caller ensures that the
+-	 * MCS node is properly initialized before updating the tail.
+-	 */
+-	return (u32)xchg_relaxed(&lock->tail,
+-				 tail >> _Q_TAIL_OFFSET) << _Q_TAIL_OFFSET;
+-}
+-
+-#else /* _Q_PENDING_BITS == 8 */
+-
+-/**
+- * clear_pending - clear the pending bit.
+- * @lock: Pointer to queued spinlock structure
+- *
+- * *,1,* -> *,0,*
+- */
+-static __always_inline void clear_pending(struct qspinlock *lock)
+-{
+-	atomic_andnot(_Q_PENDING_VAL, &lock->val);
+-}
+-
+-/**
+- * clear_pending_set_locked - take ownership and clear the pending bit.
+- * @lock: Pointer to queued spinlock structure
+- *
+- * *,1,0 -> *,0,1
+- */
+-static __always_inline void clear_pending_set_locked(struct qspinlock *lock)
+-{
+-	atomic_add(-_Q_PENDING_VAL + _Q_LOCKED_VAL, &lock->val);
+-}
+-
+-/**
+- * xchg_tail - Put in the new queue tail code word & retrieve previous one
+- * @lock : Pointer to queued spinlock structure
+- * @tail : The new queue tail code word
+- * Return: The previous queue tail code word
+- *
+- * xchg(lock, tail)
+- *
+- * p,*,* -> n,*,* ; prev = xchg(lock, node)
+- */
+-static __always_inline u32 xchg_tail(struct qspinlock *lock, u32 tail)
+-{
+-	u32 old, new;
+-
+-	old = atomic_read(&lock->val);
+-	do {
+-		new = (old & _Q_LOCKED_PENDING_MASK) | tail;
+-		/*
+-		 * We can use relaxed semantics since the caller ensures that
+-		 * the MCS node is properly initialized before updating the
+-		 * tail.
+-		 */
+-	} while (!atomic_try_cmpxchg_relaxed(&lock->val, &old, new));
+-
+-	return old;
+-}
+-#endif /* _Q_PENDING_BITS == 8 */
+-
+-/**
+- * queued_fetch_set_pending_acquire - fetch the whole lock value and set pending
+- * @lock : Pointer to queued spinlock structure
+- * Return: The previous lock value
+- *
+- * *,*,* -> *,1,*
+- */
+-#ifndef queued_fetch_set_pending_acquire
+-static __always_inline u32 queued_fetch_set_pending_acquire(struct qspinlock *lock)
+-{
+-	return atomic_fetch_or_acquire(_Q_PENDING_VAL, &lock->val);
+-}
+-#endif
+-
+-/**
+- * set_locked - Set the lock bit and own the lock
+- * @lock: Pointer to queued spinlock structure
+- *
+- * *,*,0 -> *,0,1
+- */
+-static __always_inline void set_locked(struct qspinlock *lock)
+-{
+-	WRITE_ONCE(lock->locked, _Q_LOCKED_VAL);
+-}
+-
++static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[_Q_MAX_NODES]);
+ 
+ /*
+  * Generate the native code for queued_spin_unlock_slowpath(); provide NOPs for
+@@ -410,7 +227,7 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ 	 * any MCS node. This is not the most elegant solution, but is
+ 	 * simple enough.
+ 	 */
+-	if (unlikely(idx >= MAX_NODES)) {
++	if (unlikely(idx >= _Q_MAX_NODES)) {
+ 		lockevent_inc(lock_no_node);
+ 		while (!queued_spin_trylock(lock))
+ 			cpu_relax();
+@@ -465,7 +282,7 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ 	 * head of the waitqueue.
+ 	 */
+ 	if (old & _Q_TAIL_MASK) {
+-		prev = decode_tail(old);
++		prev = decode_tail(old, qnodes);
+ 
+ 		/* Link @node into the waitqueue. */
+ 		WRITE_ONCE(prev->next, node);
+diff --git a/kernel/locking/qspinlock.h b/kernel/locking/qspinlock.h
+new file mode 100644
+index 00000000000000..d69958a844f748
+--- /dev/null
++++ b/kernel/locking/qspinlock.h
+@@ -0,0 +1,201 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Queued spinlock defines
++ *
++ * This file contains macro definitions and functions shared between different
++ * qspinlock slow path implementations.
++ */
++#ifndef __LINUX_QSPINLOCK_H
++#define __LINUX_QSPINLOCK_H
++
++#include <asm-generic/percpu.h>
++#include <linux/percpu-defs.h>
++#include <asm-generic/qspinlock.h>
++#include <asm-generic/mcs_spinlock.h>
++
++#define _Q_MAX_NODES	4
++
++/*
++ * The pending bit spinning loop count.
++ * This heuristic is used to limit the number of lockword accesses
++ * made by atomic_cond_read_relaxed when waiting for the lock to
++ * transition out of the "== _Q_PENDING_VAL" state. We don't spin
++ * indefinitely because there's no guarantee that we'll make forward
++ * progress.
++ */
++#ifndef _Q_PENDING_LOOPS
++#define _Q_PENDING_LOOPS	1
++#endif
++
++/*
++ * On 64-bit architectures, the mcs_spinlock structure will be 16 bytes in
++ * size and four of them will fit nicely in one 64-byte cacheline. For
++ * pvqspinlock, however, we need more space for extra data. To accommodate
++ * that, we insert two more long words to pad it up to 32 bytes. IOW, only
++ * two of them can fit in a cacheline in this case. That is OK as it is rare
++ * to have more than 2 levels of slowpath nesting in actual use. We don't
++ * want to penalize pvqspinlocks to optimize for a rare case in native
++ * qspinlocks.
++ */
++struct qnode {
++	struct mcs_spinlock mcs;
++#ifdef CONFIG_PARAVIRT_SPINLOCKS
++	long reserved[2];
++#endif
++};
++
++/*
++ * We must be able to distinguish between no-tail and the tail at 0:0,
++ * therefore increment the cpu number by one.
++ */
++
++static inline __pure u32 encode_tail(int cpu, int idx)
++{
++	u32 tail;
++
++	tail  = (cpu + 1) << _Q_TAIL_CPU_OFFSET;
++	tail |= idx << _Q_TAIL_IDX_OFFSET; /* assume < 4 */
++
++	return tail;
++}
++
++static inline __pure struct mcs_spinlock *decode_tail(u32 tail,
++						      struct qnode __percpu *qnodes)
++{
++	int cpu = (tail >> _Q_TAIL_CPU_OFFSET) - 1;
++	int idx = (tail &  _Q_TAIL_IDX_MASK) >> _Q_TAIL_IDX_OFFSET;
++
++	return per_cpu_ptr(&qnodes[idx].mcs, cpu);
++}
++
++static inline __pure
++struct mcs_spinlock *grab_mcs_node(struct mcs_spinlock *base, int idx)
++{
++	return &((struct qnode *)base + idx)->mcs;
++}
++
++#define _Q_LOCKED_PENDING_MASK (_Q_LOCKED_MASK | _Q_PENDING_MASK)
++
++#if _Q_PENDING_BITS == 8
++/**
++ * clear_pending - clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,* -> *,0,*
++ */
++static __always_inline void clear_pending(struct qspinlock *lock)
++{
++	WRITE_ONCE(lock->pending, 0);
++}
++
++/**
++ * clear_pending_set_locked - take ownership and clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,0 -> *,0,1
++ *
++ * Lock stealing is not allowed if this function is used.
++ */
++static __always_inline void clear_pending_set_locked(struct qspinlock *lock)
++{
++	WRITE_ONCE(lock->locked_pending, _Q_LOCKED_VAL);
++}
++
++/*
++ * xchg_tail - Put in the new queue tail code word & retrieve previous one
++ * @lock : Pointer to queued spinlock structure
++ * @tail : The new queue tail code word
++ * Return: The previous queue tail code word
++ *
++ * xchg(lock, tail), which heads an address dependency
++ *
++ * p,*,* -> n,*,* ; prev = xchg(lock, node)
++ */
++static __always_inline u32 xchg_tail(struct qspinlock *lock, u32 tail)
++{
++	/*
++	 * We can use relaxed semantics since the caller ensures that the
++	 * MCS node is properly initialized before updating the tail.
++	 */
++	return (u32)xchg_relaxed(&lock->tail,
++				 tail >> _Q_TAIL_OFFSET) << _Q_TAIL_OFFSET;
++}
++
++#else /* _Q_PENDING_BITS == 8 */
++
++/**
++ * clear_pending - clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,* -> *,0,*
++ */
++static __always_inline void clear_pending(struct qspinlock *lock)
++{
++	atomic_andnot(_Q_PENDING_VAL, &lock->val);
++}
++
++/**
++ * clear_pending_set_locked - take ownership and clear the pending bit.
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,1,0 -> *,0,1
++ */
++static __always_inline void clear_pending_set_locked(struct qspinlock *lock)
++{
++	atomic_add(-_Q_PENDING_VAL + _Q_LOCKED_VAL, &lock->val);
++}
++
++/**
++ * xchg_tail - Put in the new queue tail code word & retrieve previous one
++ * @lock : Pointer to queued spinlock structure
++ * @tail : The new queue tail code word
++ * Return: The previous queue tail code word
++ *
++ * xchg(lock, tail)
++ *
++ * p,*,* -> n,*,* ; prev = xchg(lock, node)
++ */
++static __always_inline u32 xchg_tail(struct qspinlock *lock, u32 tail)
++{
++	u32 old, new;
++
++	old = atomic_read(&lock->val);
++	do {
++		new = (old & _Q_LOCKED_PENDING_MASK) | tail;
++		/*
++		 * We can use relaxed semantics since the caller ensures that
++		 * the MCS node is properly initialized before updating the
++		 * tail.
++		 */
++	} while (!atomic_try_cmpxchg_relaxed(&lock->val, &old, new));
++
++	return old;
++}
++#endif /* _Q_PENDING_BITS == 8 */
++
++/**
++ * queued_fetch_set_pending_acquire - fetch the whole lock value and set pending
++ * @lock : Pointer to queued spinlock structure
++ * Return: The previous lock value
++ *
++ * *,*,* -> *,1,*
++ */
++#ifndef queued_fetch_set_pending_acquire
++static __always_inline u32 queued_fetch_set_pending_acquire(struct qspinlock *lock)
++{
++	return atomic_fetch_or_acquire(_Q_PENDING_VAL, &lock->val);
++}
++#endif
++
++/**
++ * set_locked - Set the lock bit and own the lock
++ * @lock: Pointer to queued spinlock structure
++ *
++ * *,*,0 -> *,0,1
++ */
++static __always_inline void set_locked(struct qspinlock *lock)
++{
++	WRITE_ONCE(lock->locked, _Q_LOCKED_VAL);
++}
++
++#endif /* __LINUX_QSPINLOCK_H */
+-- 
+cgit 1.2.3-korg
+
+
+From c0149a034540ed24de0581a09983710c88253697 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:19 -0700
+Subject: locking: Allow obtaining result of arch_mcs_spin_lock_contended
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+To support upcoming changes that require inspecting the return value
+once the conditional waiting loop in arch_mcs_spin_lock_contended
+terminates, modify the macro to preserve the result of
+smp_cond_load_acquire. This enables checking the return value as needed,
+which will help disambiguate the MCS node’s locked state in future
+patches.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-4-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/locking/mcs_spinlock.h | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/kernel/locking/mcs_spinlock.h b/kernel/locking/mcs_spinlock.h
+index 16160ca8907fbc..5c92ba199b90bb 100644
+--- a/kernel/locking/mcs_spinlock.h
++++ b/kernel/locking/mcs_spinlock.h
+@@ -24,9 +24,7 @@
+  * spinning, and smp_cond_load_acquire() provides that behavior.
+  */
+ #define arch_mcs_spin_lock_contended(l)					\
+-do {									\
+-	smp_cond_load_acquire(l, VAL);					\
+-} while (0)
++	smp_cond_load_acquire(l, VAL)
+ #endif
+ 
+ #ifndef arch_mcs_spin_unlock_contended
+-- 
+cgit 1.2.3-korg
+
+
+From a8fcf2a39bdd751e90657906889bc6619d264c19 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:20 -0700
+Subject: locking: Copy out qspinlock.c to kernel/bpf/rqspinlock.c
+
+In preparation for introducing a new lock implementation, Resilient
+Queued Spin Lock, or rqspinlock, we first begin our modifications by
+using the existing qspinlock.c code as the base. Simply copy the code to
+a new file and rename functions and variables from 'queued' to
+'resilient_queued'.
+
+Since we place the file in kernel/bpf, include needs to be relative.
+
+This helps each subsequent commit in clearly showing how and where the
+code is being changed. The only change after a literal copy in this
+commit is renaming the functions where necessary, and rename qnodes to
+rqnodes. Let's also use EXPORT_SYMBOL_GPL for rqspinlock slowpath.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-5-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/rqspinlock.c | 410 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 410 insertions(+)
+ create mode 100644 kernel/bpf/rqspinlock.c
+
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+new file mode 100644
+index 00000000000000..762108cb0f388f
+--- /dev/null
++++ b/kernel/bpf/rqspinlock.c
+@@ -0,0 +1,410 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Resilient Queued Spin Lock
++ *
++ * (C) Copyright 2013-2015 Hewlett-Packard Development Company, L.P.
++ * (C) Copyright 2013-2014,2018 Red Hat, Inc.
++ * (C) Copyright 2015 Intel Corp.
++ * (C) Copyright 2015 Hewlett-Packard Enterprise Development LP
++ *
++ * Authors: Waiman Long <longman@redhat.com>
++ *          Peter Zijlstra <peterz@infradead.org>
++ */
++
++#ifndef _GEN_PV_LOCK_SLOWPATH
++
++#include <linux/smp.h>
++#include <linux/bug.h>
++#include <linux/cpumask.h>
++#include <linux/percpu.h>
++#include <linux/hardirq.h>
++#include <linux/mutex.h>
++#include <linux/prefetch.h>
++#include <asm/byteorder.h>
++#include <asm/qspinlock.h>
++#include <trace/events/lock.h>
++
++/*
++ * Include queued spinlock definitions and statistics code
++ */
++#include "../locking/qspinlock.h"
++#include "../locking/qspinlock_stat.h"
++
++/*
++ * The basic principle of a queue-based spinlock can best be understood
++ * by studying a classic queue-based spinlock implementation called the
++ * MCS lock. A copy of the original MCS lock paper ("Algorithms for Scalable
++ * Synchronization on Shared-Memory Multiprocessors by Mellor-Crummey and
++ * Scott") is available at
++ *
++ * https://bugzilla.kernel.org/show_bug.cgi?id=206115
++ *
++ * This queued spinlock implementation is based on the MCS lock, however to
++ * make it fit the 4 bytes we assume spinlock_t to be, and preserve its
++ * existing API, we must modify it somehow.
++ *
++ * In particular; where the traditional MCS lock consists of a tail pointer
++ * (8 bytes) and needs the next pointer (another 8 bytes) of its own node to
++ * unlock the next pending (next->locked), we compress both these: {tail,
++ * next->locked} into a single u32 value.
++ *
++ * Since a spinlock disables recursion of its own context and there is a limit
++ * to the contexts that can nest; namely: task, softirq, hardirq, nmi. As there
++ * are at most 4 nesting levels, it can be encoded by a 2-bit number. Now
++ * we can encode the tail by combining the 2-bit nesting level with the cpu
++ * number. With one byte for the lock value and 3 bytes for the tail, only a
++ * 32-bit word is now needed. Even though we only need 1 bit for the lock,
++ * we extend it to a full byte to achieve better performance for architectures
++ * that support atomic byte write.
++ *
++ * We also change the first spinner to spin on the lock bit instead of its
++ * node; whereby avoiding the need to carry a node from lock to unlock, and
++ * preserving existing lock API. This also makes the unlock code simpler and
++ * faster.
++ *
++ * N.B. The current implementation only supports architectures that allow
++ *      atomic operations on smaller 8-bit and 16-bit data types.
++ *
++ */
++
++#include "../locking/mcs_spinlock.h"
++
++/*
++ * Per-CPU queue node structures; we can never have more than 4 nested
++ * contexts: task, softirq, hardirq, nmi.
++ *
++ * Exactly fits one 64-byte cacheline on a 64-bit architecture.
++ *
++ * PV doubles the storage and uses the second cacheline for PV state.
++ */
++static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
++
++/*
++ * Generate the native code for resilient_queued_spin_unlock_slowpath(); provide NOPs
++ * for all the PV callbacks.
++ */
++
++static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
++static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
++					   struct mcs_spinlock *prev) { }
++static __always_inline void __pv_kick_node(struct qspinlock *lock,
++					   struct mcs_spinlock *node) { }
++static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
++						   struct mcs_spinlock *node)
++						   { return 0; }
++
++#define pv_enabled()		false
++
++#define pv_init_node		__pv_init_node
++#define pv_wait_node		__pv_wait_node
++#define pv_kick_node		__pv_kick_node
++#define pv_wait_head_or_lock	__pv_wait_head_or_lock
++
++#ifdef CONFIG_PARAVIRT_SPINLOCKS
++#define resilient_queued_spin_lock_slowpath	native_resilient_queued_spin_lock_slowpath
++#endif
++
++#endif /* _GEN_PV_LOCK_SLOWPATH */
++
++/**
++ * resilient_queued_spin_lock_slowpath - acquire the queued spinlock
++ * @lock: Pointer to queued spinlock structure
++ * @val: Current value of the queued spinlock 32-bit word
++ *
++ * (queue tail, pending bit, lock value)
++ *
++ *              fast     :    slow                                  :    unlock
++ *                       :                                          :
++ * uncontended  (0,0,0) -:--> (0,0,1) ------------------------------:--> (*,*,0)
++ *                       :       | ^--------.------.             /  :
++ *                       :       v           \      \            |  :
++ * pending               :    (0,1,1) +--> (0,1,0)   \           |  :
++ *                       :       | ^--'              |           |  :
++ *                       :       v                   |           |  :
++ * uncontended           :    (n,x,y) +--> (n,0,0) --'           |  :
++ *   queue               :       | ^--'                          |  :
++ *                       :       v                               |  :
++ * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
++ *   queue               :         ^--'                             :
++ */
++void __lockfunc resilient_queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++{
++	struct mcs_spinlock *prev, *next, *node;
++	u32 old, tail;
++	int idx;
++
++	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
++
++	if (pv_enabled())
++		goto pv_queue;
++
++	if (virt_spin_lock(lock))
++		return;
++
++	/*
++	 * Wait for in-progress pending->locked hand-overs with a bounded
++	 * number of spins so that we guarantee forward progress.
++	 *
++	 * 0,1,0 -> 0,0,1
++	 */
++	if (val == _Q_PENDING_VAL) {
++		int cnt = _Q_PENDING_LOOPS;
++		val = atomic_cond_read_relaxed(&lock->val,
++					       (VAL != _Q_PENDING_VAL) || !cnt--);
++	}
++
++	/*
++	 * If we observe any contention; queue.
++	 */
++	if (val & ~_Q_LOCKED_MASK)
++		goto queue;
++
++	/*
++	 * trylock || pending
++	 *
++	 * 0,0,* -> 0,1,* -> 0,0,1 pending, trylock
++	 */
++	val = queued_fetch_set_pending_acquire(lock);
++
++	/*
++	 * If we observe contention, there is a concurrent locker.
++	 *
++	 * Undo and queue; our setting of PENDING might have made the
++	 * n,0,0 -> 0,0,0 transition fail and it will now be waiting
++	 * on @next to become !NULL.
++	 */
++	if (unlikely(val & ~_Q_LOCKED_MASK)) {
++
++		/* Undo PENDING if we set it. */
++		if (!(val & _Q_PENDING_MASK))
++			clear_pending(lock);
++
++		goto queue;
++	}
++
++	/*
++	 * We're pending, wait for the owner to go away.
++	 *
++	 * 0,1,1 -> *,1,0
++	 *
++	 * this wait loop must be a load-acquire such that we match the
++	 * store-release that clears the locked bit and create lock
++	 * sequentiality; this is because not all
++	 * clear_pending_set_locked() implementations imply full
++	 * barriers.
++	 */
++	if (val & _Q_LOCKED_MASK)
++		smp_cond_load_acquire(&lock->locked, !VAL);
++
++	/*
++	 * take ownership and clear the pending bit.
++	 *
++	 * 0,1,0 -> 0,0,1
++	 */
++	clear_pending_set_locked(lock);
++	lockevent_inc(lock_pending);
++	return;
++
++	/*
++	 * End of pending bit optimistic spinning and beginning of MCS
++	 * queuing.
++	 */
++queue:
++	lockevent_inc(lock_slowpath);
++pv_queue:
++	node = this_cpu_ptr(&rqnodes[0].mcs);
++	idx = node->count++;
++	tail = encode_tail(smp_processor_id(), idx);
++
++	trace_contention_begin(lock, LCB_F_SPIN);
++
++	/*
++	 * 4 nodes are allocated based on the assumption that there will
++	 * not be nested NMIs taking spinlocks. That may not be true in
++	 * some architectures even though the chance of needing more than
++	 * 4 nodes will still be extremely unlikely. When that happens,
++	 * we fall back to spinning on the lock directly without using
++	 * any MCS node. This is not the most elegant solution, but is
++	 * simple enough.
++	 */
++	if (unlikely(idx >= _Q_MAX_NODES)) {
++		lockevent_inc(lock_no_node);
++		while (!queued_spin_trylock(lock))
++			cpu_relax();
++		goto release;
++	}
++
++	node = grab_mcs_node(node, idx);
++
++	/*
++	 * Keep counts of non-zero index values:
++	 */
++	lockevent_cond_inc(lock_use_node2 + idx - 1, idx);
++
++	/*
++	 * Ensure that we increment the head node->count before initialising
++	 * the actual node. If the compiler is kind enough to reorder these
++	 * stores, then an IRQ could overwrite our assignments.
++	 */
++	barrier();
++
++	node->locked = 0;
++	node->next = NULL;
++	pv_init_node(node);
++
++	/*
++	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
++	 * attempt the trylock once more in the hope someone let go while we
++	 * weren't watching.
++	 */
++	if (queued_spin_trylock(lock))
++		goto release;
++
++	/*
++	 * Ensure that the initialisation of @node is complete before we
++	 * publish the updated tail via xchg_tail() and potentially link
++	 * @node into the waitqueue via WRITE_ONCE(prev->next, node) below.
++	 */
++	smp_wmb();
++
++	/*
++	 * Publish the updated tail.
++	 * We have already touched the queueing cacheline; don't bother with
++	 * pending stuff.
++	 *
++	 * p,*,* -> n,*,*
++	 */
++	old = xchg_tail(lock, tail);
++	next = NULL;
++
++	/*
++	 * if there was a previous node; link it and wait until reaching the
++	 * head of the waitqueue.
++	 */
++	if (old & _Q_TAIL_MASK) {
++		prev = decode_tail(old, rqnodes);
++
++		/* Link @node into the waitqueue. */
++		WRITE_ONCE(prev->next, node);
++
++		pv_wait_node(node, prev);
++		arch_mcs_spin_lock_contended(&node->locked);
++
++		/*
++		 * While waiting for the MCS lock, the next pointer may have
++		 * been set by another lock waiter. We optimistically load
++		 * the next pointer & prefetch the cacheline for writing
++		 * to reduce latency in the upcoming MCS unlock operation.
++		 */
++		next = READ_ONCE(node->next);
++		if (next)
++			prefetchw(next);
++	}
++
++	/*
++	 * we're at the head of the waitqueue, wait for the owner & pending to
++	 * go away.
++	 *
++	 * *,x,y -> *,0,0
++	 *
++	 * this wait loop must use a load-acquire such that we match the
++	 * store-release that clears the locked bit and create lock
++	 * sequentiality; this is because the set_locked() function below
++	 * does not imply a full barrier.
++	 *
++	 * The PV pv_wait_head_or_lock function, if active, will acquire
++	 * the lock and return a non-zero value. So we have to skip the
++	 * atomic_cond_read_acquire() call. As the next PV queue head hasn't
++	 * been designated yet, there is no way for the locked value to become
++	 * _Q_SLOW_VAL. So both the set_locked() and the
++	 * atomic_cmpxchg_relaxed() calls will be safe.
++	 *
++	 * If PV isn't active, 0 will be returned instead.
++	 *
++	 */
++	if ((val = pv_wait_head_or_lock(lock, node)))
++		goto locked;
++
++	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
++
++locked:
++	/*
++	 * claim the lock:
++	 *
++	 * n,0,0 -> 0,0,1 : lock, uncontended
++	 * *,*,0 -> *,*,1 : lock, contended
++	 *
++	 * If the queue head is the only one in the queue (lock value == tail)
++	 * and nobody is pending, clear the tail code and grab the lock.
++	 * Otherwise, we only need to grab the lock.
++	 */
++
++	/*
++	 * In the PV case we might already have _Q_LOCKED_VAL set, because
++	 * of lock stealing; therefore we must also allow:
++	 *
++	 * n,0,1 -> 0,0,1
++	 *
++	 * Note: at this point: (val & _Q_PENDING_MASK) == 0, because of the
++	 *       above wait condition, therefore any concurrent setting of
++	 *       PENDING will make the uncontended transition fail.
++	 */
++	if ((val & _Q_TAIL_MASK) == tail) {
++		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL))
++			goto release; /* No contention */
++	}
++
++	/*
++	 * Either somebody is queued behind us or _Q_PENDING_VAL got set
++	 * which will then detect the remaining tail and queue behind us
++	 * ensuring we'll see a @next.
++	 */
++	set_locked(lock);
++
++	/*
++	 * contended path; wait for next if not observed yet, release.
++	 */
++	if (!next)
++		next = smp_cond_load_relaxed(&node->next, (VAL));
++
++	arch_mcs_spin_unlock_contended(&next->locked);
++	pv_kick_node(lock, next);
++
++release:
++	trace_contention_end(lock, 0);
++
++	/*
++	 * release the node
++	 */
++	__this_cpu_dec(rqnodes[0].mcs.count);
++}
++EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
++
++/*
++ * Generate the paravirt code for resilient_queued_spin_unlock_slowpath().
++ */
++#if !defined(_GEN_PV_LOCK_SLOWPATH) && defined(CONFIG_PARAVIRT_SPINLOCKS)
++#define _GEN_PV_LOCK_SLOWPATH
++
++#undef  pv_enabled
++#define pv_enabled()	true
++
++#undef pv_init_node
++#undef pv_wait_node
++#undef pv_kick_node
++#undef pv_wait_head_or_lock
++
++#undef  resilient_queued_spin_lock_slowpath
++#define resilient_queued_spin_lock_slowpath	__pv_resilient_queued_spin_lock_slowpath
++
++#include "../locking/qspinlock_paravirt.h"
++#include "rqspinlock.c"
++
++bool nopvspin;
++static __init int parse_nopvspin(char *arg)
++{
++	nopvspin = true;
++	return 0;
++}
++early_param("nopvspin", parse_nopvspin);
++#endif
+-- 
+cgit 1.2.3-korg
+
+
+From 30ff133277eba8b7f30013c9f27b1c8257418e6a Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:21 -0700
+Subject: rqspinlock: Add rqspinlock.h header
+
+This header contains the public declarations usable in the rest of the
+kernel for rqspinlock.
+
+Let's also type alias qspinlock to rqspinlock_t to ensure consistent use
+of the new lock type. We want to remove dependence on the qspinlock type
+in later patches as we need to provide a test-and-set fallback, hence
+begin abstracting away from now onwards.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-6-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h | 19 +++++++++++++++++++
+ kernel/bpf/rqspinlock.c          |  3 ++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+ create mode 100644 include/asm-generic/rqspinlock.h
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+new file mode 100644
+index 00000000000000..22f8094d055002
+--- /dev/null
++++ b/include/asm-generic/rqspinlock.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Resilient Queued Spin Lock
++ *
++ * (C) Copyright 2024-2025 Meta Platforms, Inc. and affiliates.
++ *
++ * Authors: Kumar Kartikeya Dwivedi <memxor@gmail.com>
++ */
++#ifndef __ASM_GENERIC_RQSPINLOCK_H
++#define __ASM_GENERIC_RQSPINLOCK_H
++
++#include <linux/types.h>
++
++struct qspinlock;
++typedef struct qspinlock rqspinlock_t;
++
++extern void resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
++
++#endif /* __ASM_GENERIC_RQSPINLOCK_H */
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 762108cb0f388f..93e31633c2aa09 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -23,6 +23,7 @@
+ #include <asm/byteorder.h>
+ #include <asm/qspinlock.h>
+ #include <trace/events/lock.h>
++#include <asm/rqspinlock.h>
+ 
+ /*
+  * Include queued spinlock definitions and statistics code
+@@ -127,7 +128,7 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
+  * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
+  *   queue               :         ^--'                             :
+  */
+-void __lockfunc resilient_queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ {
+ 	struct mcs_spinlock *prev, *next, *node;
+ 	u32 old, tail;
+-- 
+cgit 1.2.3-korg
+
+
+From a926d09922592471d55d16aef6f9bfb229be7b6a Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:22 -0700
+Subject: rqspinlock: Drop PV and virtualization support
+
+Changes to rqspinlock in subsequent commits will be algorithmic
+modifications, which won't remain in agreement with the implementations
+of paravirt spin lock and virt_spin_lock support. These future changes
+include measures for terminating waiting loops in slow path after a
+certain point. While using a fair lock like qspinlock directly inside
+virtual machines leads to suboptimal performance under certain
+conditions, we cannot use the existing virtualization support before we
+make it resilient as well.  Therefore, drop it for now.
+
+Note that we need to drop qspinlock_stat.h, as it's only relevant in
+case of CONFIG_PARAVIRT_SPINLOCKS=y, but we need to keep lock_events.h
+in the includes, which was indirectly pulled in before.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-7-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/rqspinlock.c | 91 +------------------------------------------------
+ 1 file changed, 1 insertion(+), 90 deletions(-)
+
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 93e31633c2aa09..c2646cffc59e4f 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -11,8 +11,6 @@
+  *          Peter Zijlstra <peterz@infradead.org>
+  */
+ 
+-#ifndef _GEN_PV_LOCK_SLOWPATH
+-
+ #include <linux/smp.h>
+ #include <linux/bug.h>
+ #include <linux/cpumask.h>
+@@ -29,7 +27,7 @@
+  * Include queued spinlock definitions and statistics code
+  */
+ #include "../locking/qspinlock.h"
+-#include "../locking/qspinlock_stat.h"
++#include "../locking/lock_events.h"
+ 
+ /*
+  * The basic principle of a queue-based spinlock can best be understood
+@@ -75,38 +73,9 @@
+  * contexts: task, softirq, hardirq, nmi.
+  *
+  * Exactly fits one 64-byte cacheline on a 64-bit architecture.
+- *
+- * PV doubles the storage and uses the second cacheline for PV state.
+  */
+ static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+ 
+-/*
+- * Generate the native code for resilient_queued_spin_unlock_slowpath(); provide NOPs
+- * for all the PV callbacks.
+- */
+-
+-static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
+-static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
+-					   struct mcs_spinlock *prev) { }
+-static __always_inline void __pv_kick_node(struct qspinlock *lock,
+-					   struct mcs_spinlock *node) { }
+-static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
+-						   struct mcs_spinlock *node)
+-						   { return 0; }
+-
+-#define pv_enabled()		false
+-
+-#define pv_init_node		__pv_init_node
+-#define pv_wait_node		__pv_wait_node
+-#define pv_kick_node		__pv_kick_node
+-#define pv_wait_head_or_lock	__pv_wait_head_or_lock
+-
+-#ifdef CONFIG_PARAVIRT_SPINLOCKS
+-#define resilient_queued_spin_lock_slowpath	native_resilient_queued_spin_lock_slowpath
+-#endif
+-
+-#endif /* _GEN_PV_LOCK_SLOWPATH */
+-
+ /**
+  * resilient_queued_spin_lock_slowpath - acquire the queued spinlock
+  * @lock: Pointer to queued spinlock structure
+@@ -136,12 +105,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 
+ 	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
+ 
+-	if (pv_enabled())
+-		goto pv_queue;
+-
+-	if (virt_spin_lock(lock))
+-		return;
+-
+ 	/*
+ 	 * Wait for in-progress pending->locked hand-overs with a bounded
+ 	 * number of spins so that we guarantee forward progress.
+@@ -212,7 +175,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ queue:
+ 	lockevent_inc(lock_slowpath);
+-pv_queue:
+ 	node = this_cpu_ptr(&rqnodes[0].mcs);
+ 	idx = node->count++;
+ 	tail = encode_tail(smp_processor_id(), idx);
+@@ -251,7 +213,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 
+ 	node->locked = 0;
+ 	node->next = NULL;
+-	pv_init_node(node);
+ 
+ 	/*
+ 	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
+@@ -288,7 +249,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 		/* Link @node into the waitqueue. */
+ 		WRITE_ONCE(prev->next, node);
+ 
+-		pv_wait_node(node, prev);
+ 		arch_mcs_spin_lock_contended(&node->locked);
+ 
+ 		/*
+@@ -312,23 +272,9 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 * store-release that clears the locked bit and create lock
+ 	 * sequentiality; this is because the set_locked() function below
+ 	 * does not imply a full barrier.
+-	 *
+-	 * The PV pv_wait_head_or_lock function, if active, will acquire
+-	 * the lock and return a non-zero value. So we have to skip the
+-	 * atomic_cond_read_acquire() call. As the next PV queue head hasn't
+-	 * been designated yet, there is no way for the locked value to become
+-	 * _Q_SLOW_VAL. So both the set_locked() and the
+-	 * atomic_cmpxchg_relaxed() calls will be safe.
+-	 *
+-	 * If PV isn't active, 0 will be returned instead.
+-	 *
+ 	 */
+-	if ((val = pv_wait_head_or_lock(lock, node)))
+-		goto locked;
+-
+ 	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
+ 
+-locked:
+ 	/*
+ 	 * claim the lock:
+ 	 *
+@@ -341,11 +287,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ 
+ 	/*
+-	 * In the PV case we might already have _Q_LOCKED_VAL set, because
+-	 * of lock stealing; therefore we must also allow:
+-	 *
+-	 * n,0,1 -> 0,0,1
+-	 *
+ 	 * Note: at this point: (val & _Q_PENDING_MASK) == 0, because of the
+ 	 *       above wait condition, therefore any concurrent setting of
+ 	 *       PENDING will make the uncontended transition fail.
+@@ -369,7 +310,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 		next = smp_cond_load_relaxed(&node->next, (VAL));
+ 
+ 	arch_mcs_spin_unlock_contended(&next->locked);
+-	pv_kick_node(lock, next);
+ 
+ release:
+ 	trace_contention_end(lock, 0);
+@@ -380,32 +320,3 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	__this_cpu_dec(rqnodes[0].mcs.count);
+ }
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
+-
+-/*
+- * Generate the paravirt code for resilient_queued_spin_unlock_slowpath().
+- */
+-#if !defined(_GEN_PV_LOCK_SLOWPATH) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+-#define _GEN_PV_LOCK_SLOWPATH
+-
+-#undef  pv_enabled
+-#define pv_enabled()	true
+-
+-#undef pv_init_node
+-#undef pv_wait_node
+-#undef pv_kick_node
+-#undef pv_wait_head_or_lock
+-
+-#undef  resilient_queued_spin_lock_slowpath
+-#define resilient_queued_spin_lock_slowpath	__pv_resilient_queued_spin_lock_slowpath
+-
+-#include "../locking/qspinlock_paravirt.h"
+-#include "rqspinlock.c"
+-
+-bool nopvspin;
+-static __init int parse_nopvspin(char *arg)
+-{
+-	nopvspin = true;
+-	return 0;
+-}
+-early_param("nopvspin", parse_nopvspin);
+-#endif
+-- 
+cgit 1.2.3-korg
+
+
+From 14c48ee81452752d85e55a9b55e18cd90d251193 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:23 -0700
+Subject: rqspinlock: Add support for timeouts
+
+Introduce policy macro RES_CHECK_TIMEOUT which can be used to detect
+when the timeout has expired for the slow path to return an error. It
+depends on being passed two variables initialized to 0: ts, ret. The
+'ts' parameter is of type rqspinlock_timeout.
+
+This macro resolves to the (ret) expression so that it can be used in
+statements like smp_cond_load_acquire to break the waiting loop
+condition.
+
+The 'spin' member is used to amortize the cost of checking time by
+dispatching to the implementation every 64k iterations. The
+'timeout_end' member is used to keep track of the timestamp that denotes
+the end of the waiting period. The 'ret' parameter denotes the status of
+the timeout, and can be checked in the slow path to detect timeouts
+after waiting loops.
+
+The 'duration' member is used to store the timeout duration for each
+waiting loop. The default timeout value defined in the header
+(RES_DEF_TIMEOUT) is 0.25 seconds.
+
+This macro will be used as a condition for waiting loops in the slow
+path.  Since each waiting loop applies a fresh timeout using the same
+rqspinlock_timeout, we add a new RES_RESET_TIMEOUT as well to ensure the
+values can be easily reinitialized to the default state.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-8-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h |  6 ++++++
+ kernel/bpf/rqspinlock.c          | 45 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index 22f8094d055002..5dd4dd8aee69e8 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -10,10 +10,16 @@
+ #define __ASM_GENERIC_RQSPINLOCK_H
+ 
+ #include <linux/types.h>
++#include <vdso/time64.h>
+ 
+ struct qspinlock;
+ typedef struct qspinlock rqspinlock_t;
+ 
+ extern void resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
+ 
++/*
++ * Default timeout for waiting loops is 0.25 seconds
++ */
++#define RES_DEF_TIMEOUT (NSEC_PER_SEC / 4)
++
+ #endif /* __ASM_GENERIC_RQSPINLOCK_H */
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index c2646cffc59e4f..0d8964b4d44aff 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -6,9 +6,11 @@
+  * (C) Copyright 2013-2014,2018 Red Hat, Inc.
+  * (C) Copyright 2015 Intel Corp.
+  * (C) Copyright 2015 Hewlett-Packard Enterprise Development LP
++ * (C) Copyright 2024-2025 Meta Platforms, Inc. and affiliates.
+  *
+  * Authors: Waiman Long <longman@redhat.com>
+  *          Peter Zijlstra <peterz@infradead.org>
++ *          Kumar Kartikeya Dwivedi <memxor@gmail.com>
+  */
+ 
+ #include <linux/smp.h>
+@@ -22,6 +24,7 @@
+ #include <asm/qspinlock.h>
+ #include <trace/events/lock.h>
+ #include <asm/rqspinlock.h>
++#include <linux/timekeeping.h>
+ 
+ /*
+  * Include queued spinlock definitions and statistics code
+@@ -68,6 +71,45 @@
+ 
+ #include "../locking/mcs_spinlock.h"
+ 
++struct rqspinlock_timeout {
++	u64 timeout_end;
++	u64 duration;
++	u16 spin;
++};
++
++static noinline int check_timeout(struct rqspinlock_timeout *ts)
++{
++	u64 time = ktime_get_mono_fast_ns();
++
++	if (!ts->timeout_end) {
++		ts->timeout_end = time + ts->duration;
++		return 0;
++	}
++
++	if (time > ts->timeout_end)
++		return -ETIMEDOUT;
++
++	return 0;
++}
++
++#define RES_CHECK_TIMEOUT(ts, ret)                    \
++	({                                            \
++		if (!(ts).spin++)                     \
++			(ret) = check_timeout(&(ts)); \
++		(ret);                                \
++	})
++
++/*
++ * Initialize the 'spin' member.
++ */
++#define RES_INIT_TIMEOUT(ts) ({ (ts).spin = 1; })
++
++/*
++ * We only need to reset 'timeout_end', 'spin' will just wrap around as necessary.
++ * Duration is defined for each spin attempt, so set it here.
++ */
++#define RES_RESET_TIMEOUT(ts, _duration) ({ (ts).timeout_end = 0; (ts).duration = _duration; })
++
+ /*
+  * Per-CPU queue node structures; we can never have more than 4 nested
+  * contexts: task, softirq, hardirq, nmi.
+@@ -100,11 +142,14 @@ static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ {
+ 	struct mcs_spinlock *prev, *next, *node;
++	struct rqspinlock_timeout ts;
+ 	u32 old, tail;
+ 	int idx;
+ 
+ 	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
+ 
++	RES_INIT_TIMEOUT(ts);
++
+ 	/*
+ 	 * Wait for in-progress pending->locked hand-overs with a bounded
+ 	 * number of spins so that we guarantee forward progress.
+-- 
+cgit 1.2.3-korg
+
+
+From ebababcd03729db14b2dd911d6600af84415509c Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:24 -0700
+Subject: rqspinlock: Hardcode cond_acquire loops for arm64
+
+Currently, for rqspinlock usage, the implementation of
+smp_cond_load_acquire (and thus, atomic_cond_read_acquire) are
+susceptible to stalls on arm64, because they do not guarantee that the
+conditional expression will be repeatedly invoked if the address being
+loaded from is not written to by other CPUs. When support for
+event-streams is absent (which unblocks stuck WFE-based loops every
+~100us), we may end up being stuck forever.
+
+This causes a problem for us, as we need to repeatedly invoke the
+RES_CHECK_TIMEOUT in the spin loop to break out when the timeout
+expires.
+
+Let us import the smp_cond_load_acquire_timewait implementation Ankur is
+proposing in [0], and then fallback to it once it is merged.
+
+While we rely on the implementation to amortize the cost of sampling
+check_timeout for us, it will not happen when event stream support is
+unavailable. This is not the common case, and it would be difficult to
+fit our logic in the time_expr_ns >= time_limit_ns comparison, hence
+just let it be.
+
+  [0]: https://lore.kernel.org/lkml/20250203214911.898276-1-ankur.a.arora@oracle.com
+
+Cc: Ankur Arora <ankur.a.arora@oracle.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-9-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ arch/arm64/include/asm/rqspinlock.h | 93 +++++++++++++++++++++++++++++++++++++
+ kernel/bpf/rqspinlock.c             | 15 ++++++
+ 2 files changed, 108 insertions(+)
+ create mode 100644 arch/arm64/include/asm/rqspinlock.h
+
+diff --git a/arch/arm64/include/asm/rqspinlock.h b/arch/arm64/include/asm/rqspinlock.h
+new file mode 100644
+index 00000000000000..5b80785324b6c3
+--- /dev/null
++++ b/arch/arm64/include/asm/rqspinlock.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_RQSPINLOCK_H
++#define _ASM_RQSPINLOCK_H
++
++#include <asm/barrier.h>
++
++/*
++ * Hardcode res_smp_cond_load_acquire implementations for arm64 to a custom
++ * version based on [0]. In rqspinlock code, our conditional expression involves
++ * checking the value _and_ additionally a timeout. However, on arm64, the
++ * WFE-based implementation may never spin again if no stores occur to the
++ * locked byte in the lock word. As such, we may be stuck forever if
++ * event-stream based unblocking is not available on the platform for WFE spin
++ * loops (arch_timer_evtstrm_available).
++ *
++ * Once support for smp_cond_load_acquire_timewait [0] lands, we can drop this
++ * copy-paste.
++ *
++ * While we rely on the implementation to amortize the cost of sampling
++ * cond_expr for us, it will not happen when event stream support is
++ * unavailable, time_expr check is amortized. This is not the common case, and
++ * it would be difficult to fit our logic in the time_expr_ns >= time_limit_ns
++ * comparison, hence just let it be. In case of event-stream, the loop is woken
++ * up at microsecond granularity.
++ *
++ * [0]: https://lore.kernel.org/lkml/20250203214911.898276-1-ankur.a.arora@oracle.com
++ */
++
++#ifndef smp_cond_load_acquire_timewait
++
++#define smp_cond_time_check_count	200
++
++#define __smp_cond_load_relaxed_spinwait(ptr, cond_expr, time_expr_ns,	\
++					 time_limit_ns) ({		\
++	typeof(ptr) __PTR = (ptr);					\
++	__unqual_scalar_typeof(*ptr) VAL;				\
++	unsigned int __count = 0;					\
++	for (;;) {							\
++		VAL = READ_ONCE(*__PTR);				\
++		if (cond_expr)						\
++			break;						\
++		cpu_relax();						\
++		if (__count++ < smp_cond_time_check_count)		\
++			continue;					\
++		if ((time_expr_ns) >= (time_limit_ns))			\
++			break;						\
++		__count = 0;						\
++	}								\
++	(typeof(*ptr))VAL;						\
++})
++
++#define __smp_cond_load_acquire_timewait(ptr, cond_expr,		\
++					 time_expr_ns, time_limit_ns)	\
++({									\
++	typeof(ptr) __PTR = (ptr);					\
++	__unqual_scalar_typeof(*ptr) VAL;				\
++	for (;;) {							\
++		VAL = smp_load_acquire(__PTR);				\
++		if (cond_expr)						\
++			break;						\
++		__cmpwait_relaxed(__PTR, VAL);				\
++		if ((time_expr_ns) >= (time_limit_ns))			\
++			break;						\
++	}								\
++	(typeof(*ptr))VAL;						\
++})
++
++#define smp_cond_load_acquire_timewait(ptr, cond_expr,			\
++				      time_expr_ns, time_limit_ns)	\
++({									\
++	__unqual_scalar_typeof(*ptr) _val;				\
++	int __wfe = arch_timer_evtstrm_available();			\
++									\
++	if (likely(__wfe)) {						\
++		_val = __smp_cond_load_acquire_timewait(ptr, cond_expr,	\
++							time_expr_ns,	\
++							time_limit_ns);	\
++	} else {							\
++		_val = __smp_cond_load_relaxed_spinwait(ptr, cond_expr,	\
++							time_expr_ns,	\
++							time_limit_ns);	\
++		smp_acquire__after_ctrl_dep();				\
++	}								\
++	(typeof(*ptr))_val;						\
++})
++
++#endif
++
++#define res_smp_cond_load_acquire_timewait(v, c) smp_cond_load_acquire_timewait(v, c, 0, 1)
++
++#include <asm-generic/rqspinlock.h>
++
++#endif /* _ASM_RQSPINLOCK_H */
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 0d8964b4d44aff..d429b923b58f35 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -92,12 +92,21 @@ static noinline int check_timeout(struct rqspinlock_timeout *ts)
+ 	return 0;
+ }
+ 
++/*
++ * Do not amortize with spins when res_smp_cond_load_acquire is defined,
++ * as the macro does internal amortization for us.
++ */
++#ifndef res_smp_cond_load_acquire
+ #define RES_CHECK_TIMEOUT(ts, ret)                    \
+ 	({                                            \
+ 		if (!(ts).spin++)                     \
+ 			(ret) = check_timeout(&(ts)); \
+ 		(ret);                                \
+ 	})
++#else
++#define RES_CHECK_TIMEOUT(ts, ret, mask)	      \
++	({ (ret) = check_timeout(&(ts)); })
++#endif
+ 
+ /*
+  * Initialize the 'spin' member.
+@@ -118,6 +127,12 @@ static noinline int check_timeout(struct rqspinlock_timeout *ts)
+  */
+ static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+ 
++#ifndef res_smp_cond_load_acquire
++#define res_smp_cond_load_acquire(v, c) smp_cond_load_acquire(v, c)
++#endif
++
++#define res_atomic_cond_read_acquire(v, c) res_smp_cond_load_acquire(&(v)->counter, (c))
++
+ /**
+  * resilient_queued_spin_lock_slowpath - acquire the queued spinlock
+  * @lock: Pointer to queued spinlock structure
+-- 
+cgit 1.2.3-korg
+
+
+From 337ffea51aeec0b2212d862383a04088e5c063f7 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:25 -0700
+Subject: rqspinlock: Protect pending bit owners from stalls
+
+The pending bit is used to avoid queueing in case the lock is
+uncontended, and has demonstrated benefits for the 2 contender scenario,
+esp. on x86. In case the pending bit is acquired and we wait for the
+locked bit to disappear, we may get stuck due to the lock owner not
+making progress. Hence, this waiting loop must be protected with a
+timeout check.
+
+To perform a graceful recovery once we decide to abort our lock
+acquisition attempt in this case, we must unset the pending bit since we
+own it. All waiters undoing their changes and exiting gracefully allows
+the lock word to be restored to the unlocked state once all participants
+(owner, waiters) have been recovered, and the lock remains usable.
+Hence, set the pending bit back to zero before returning to the caller.
+
+Introduce a lockevent (rqspinlock_lock_timeout) to capture timeout
+event statistics.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-10-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h  |  2 +-
+ kernel/bpf/rqspinlock.c           | 32 +++++++++++++++++++++++++++-----
+ kernel/locking/lock_events_list.h |  5 +++++
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index 5dd4dd8aee69e8..9bd11cb7acd60c 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -15,7 +15,7 @@
+ struct qspinlock;
+ typedef struct qspinlock rqspinlock_t;
+ 
+-extern void resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
++extern int resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
+ 
+ /*
+  * Default timeout for waiting loops is 0.25 seconds
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index d429b923b58f35..262294cfd36f40 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -138,6 +138,10 @@ static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+  * @lock: Pointer to queued spinlock structure
+  * @val: Current value of the queued spinlock 32-bit word
+  *
++ * Return:
++ * * 0		- Lock was acquired successfully.
++ * * -ETIMEDOUT - Lock acquisition failed because of timeout.
++ *
+  * (queue tail, pending bit, lock value)
+  *
+  *              fast     :    slow                                  :    unlock
+@@ -154,12 +158,12 @@ static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+  * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
+  *   queue               :         ^--'                             :
+  */
+-void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
++int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ {
+ 	struct mcs_spinlock *prev, *next, *node;
+ 	struct rqspinlock_timeout ts;
++	int idx, ret = 0;
+ 	u32 old, tail;
+-	int idx;
+ 
+ 	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
+ 
+@@ -217,8 +221,25 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 * clear_pending_set_locked() implementations imply full
+ 	 * barriers.
+ 	 */
+-	if (val & _Q_LOCKED_MASK)
+-		smp_cond_load_acquire(&lock->locked, !VAL);
++	if (val & _Q_LOCKED_MASK) {
++		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
++		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret));
++	}
++
++	if (ret) {
++		/*
++		 * We waited for the locked bit to go back to 0, as the pending
++		 * waiter, but timed out. We need to clear the pending bit since
++		 * we own it. Once a stuck owner has been recovered, the lock
++		 * must be restored to a valid state, hence removing the pending
++		 * bit is necessary.
++		 *
++		 * *,1,* -> *,0,*
++		 */
++		clear_pending(lock);
++		lockevent_inc(rqspinlock_lock_timeout);
++		return ret;
++	}
+ 
+ 	/*
+ 	 * take ownership and clear the pending bit.
+@@ -227,7 +248,7 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ 	clear_pending_set_locked(lock);
+ 	lockevent_inc(lock_pending);
+-	return;
++	return 0;
+ 
+ 	/*
+ 	 * End of pending bit optimistic spinning and beginning of MCS
+@@ -378,5 +399,6 @@ void __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 * release the node
+ 	 */
+ 	__this_cpu_dec(rqnodes[0].mcs.count);
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
+diff --git a/kernel/locking/lock_events_list.h b/kernel/locking/lock_events_list.h
+index 97fb6f3f840aa7..c5286249994d0c 100644
+--- a/kernel/locking/lock_events_list.h
++++ b/kernel/locking/lock_events_list.h
+@@ -49,6 +49,11 @@ LOCK_EVENT(lock_use_node4)	/* # of locking ops that use 4th percpu node */
+ LOCK_EVENT(lock_no_node)	/* # of locking ops w/o using percpu node    */
+ #endif /* CONFIG_QUEUED_SPINLOCKS */
+ 
++/*
++ * Locking events for Resilient Queued Spin Lock
++ */
++LOCK_EVENT(rqspinlock_lock_timeout)	/* # of locking ops that timeout	*/
++
+ /*
+  * Locking events for rwsem
+  */
+-- 
+cgit 1.2.3-korg
+
+
+From 164c246571e97b6f1bdcc7ff5bb68f16da8afedc Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:26 -0700
+Subject: rqspinlock: Protect waiters in queue from stalls
+
+Implement the wait queue cleanup algorithm for rqspinlock. There are
+three forms of waiters in the original queued spin lock algorithm. The
+first is the waiter which acquires the pending bit and spins on the lock
+word without forming a wait queue. The second is the head waiter that is
+the first waiter heading the wait queue. The third form is of all the
+non-head waiters queued behind the head, waiting to be signalled through
+their MCS node to overtake the responsibility of the head.
+
+In this commit, we are concerned with the second and third kind. First,
+we augment the waiting loop of the head of the wait queue with a
+timeout. When this timeout happens, all waiters part of the wait queue
+will abort their lock acquisition attempts. This happens in three steps.
+First, the head breaks out of its loop waiting for pending and locked
+bits to turn to 0, and non-head waiters break out of their MCS node spin
+(more on that later). Next, every waiter (head or non-head) attempts to
+check whether they are also the tail waiter, in such a case they attempt
+to zero out the tail word and allow a new queue to be built up for this
+lock. If they succeed, they have no one to signal next in the queue to
+stop spinning. Otherwise, they signal the MCS node of the next waiter to
+break out of its spin and try resetting the tail word back to 0. This
+goes on until the tail waiter is found. In case of races, the new tail
+will be responsible for performing the same task, as the old tail will
+then fail to reset the tail word and wait for its next pointer to be
+updated before it signals the new tail to do the same.
+
+We terminate the whole wait queue because of two main reasons. Firstly,
+we eschew per-waiter timeouts with one applied at the head of the wait
+queue.  This allows everyone to break out faster once we've seen the
+owner / pending waiter not responding for the timeout duration from the
+head.  Secondly, it avoids complicated synchronization, because when not
+leaving in FIFO order, prev's next pointer needs to be fixed up etc.
+
+Lastly, all of these waiters release the rqnode and return to the
+caller. This patch underscores the point that rqspinlock's timeout does
+not apply to each waiter individually, and cannot be relied upon as an
+upper bound. It is possible for the rqspinlock waiters to return early
+from a failed lock acquisition attempt as soon as stalls are detected.
+
+The head waiter cannot directly WRITE_ONCE the tail to zero, as it may
+race with a concurrent xchg and a non-head waiter linking its MCS node
+to the head's MCS node through 'prev->next' assignment.
+
+One notable thing is that we must use RES_DEF_TIMEOUT * 2 as our maximum
+duration for the waiting loop (for the wait queue head), since we may
+have both the owner and pending bit waiter ahead of us, and in the worst
+case, need to span their maximum permitted critical section lengths.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-11-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/rqspinlock.c | 55 ++++++++++++++++++++++++++++++++++++++++++++++---
+ kernel/bpf/rqspinlock.h | 48 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 100 insertions(+), 3 deletions(-)
+ create mode 100644 kernel/bpf/rqspinlock.h
+
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 262294cfd36f40..65c2b41d89373f 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -77,6 +77,8 @@ struct rqspinlock_timeout {
+ 	u16 spin;
+ };
+ 
++#define RES_TIMEOUT_VAL	2
++
+ static noinline int check_timeout(struct rqspinlock_timeout *ts)
+ {
+ 	u64 time = ktime_get_mono_fast_ns();
+@@ -325,12 +327,18 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 * head of the waitqueue.
+ 	 */
+ 	if (old & _Q_TAIL_MASK) {
++		int val;
++
+ 		prev = decode_tail(old, rqnodes);
+ 
+ 		/* Link @node into the waitqueue. */
+ 		WRITE_ONCE(prev->next, node);
+ 
+-		arch_mcs_spin_lock_contended(&node->locked);
++		val = arch_mcs_spin_lock_contended(&node->locked);
++		if (val == RES_TIMEOUT_VAL) {
++			ret = -EDEADLK;
++			goto waitq_timeout;
++		}
+ 
+ 		/*
+ 		 * While waiting for the MCS lock, the next pointer may have
+@@ -353,8 +361,49 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 * store-release that clears the locked bit and create lock
+ 	 * sequentiality; this is because the set_locked() function below
+ 	 * does not imply a full barrier.
++	 *
++	 * We use RES_DEF_TIMEOUT * 2 as the duration, as RES_DEF_TIMEOUT is
++	 * meant to span maximum allowed time per critical section, and we may
++	 * have both the owner of the lock and the pending bit waiter ahead of
++	 * us.
+ 	 */
+-	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
++	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
++	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK) ||
++					   RES_CHECK_TIMEOUT(ts, ret));
++
++waitq_timeout:
++	if (ret) {
++		/*
++		 * If the tail is still pointing to us, then we are the final waiter,
++		 * and are responsible for resetting the tail back to 0. Otherwise, if
++		 * the cmpxchg operation fails, we signal the next waiter to take exit
++		 * and try the same. For a waiter with tail node 'n':
++		 *
++		 * n,*,* -> 0,*,*
++		 *
++		 * When performing cmpxchg for the whole word (NR_CPUS > 16k), it is
++		 * possible locked/pending bits keep changing and we see failures even
++		 * when we remain the head of wait queue. However, eventually,
++		 * pending bit owner will unset the pending bit, and new waiters
++		 * will queue behind us. This will leave the lock owner in
++		 * charge, and it will eventually either set locked bit to 0, or
++		 * leave it as 1, allowing us to make progress.
++		 *
++		 * We terminate the whole wait queue for two reasons. Firstly,
++		 * we eschew per-waiter timeouts with one applied at the head of
++		 * the wait queue.  This allows everyone to break out faster
++		 * once we've seen the owner / pending waiter not responding for
++		 * the timeout duration from the head.  Secondly, it avoids
++		 * complicated synchronization, because when not leaving in FIFO
++		 * order, prev's next pointer needs to be fixed up etc.
++		 */
++		if (!try_cmpxchg_tail(lock, tail, 0)) {
++			next = smp_cond_load_relaxed(&node->next, VAL);
++			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
++		}
++		lockevent_inc(rqspinlock_lock_timeout);
++		goto release;
++	}
+ 
+ 	/*
+ 	 * claim the lock:
+@@ -399,6 +448,6 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 * release the node
+ 	 */
+ 	__this_cpu_dec(rqnodes[0].mcs.count);
+-	return 0;
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
+diff --git a/kernel/bpf/rqspinlock.h b/kernel/bpf/rqspinlock.h
+new file mode 100644
+index 00000000000000..5d8cb1b1aab4d0
+--- /dev/null
++++ b/kernel/bpf/rqspinlock.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Resilient Queued Spin Lock defines
++ *
++ * (C) Copyright 2024-2025 Meta Platforms, Inc. and affiliates.
++ *
++ * Authors: Kumar Kartikeya Dwivedi <memxor@gmail.com>
++ */
++#ifndef __LINUX_RQSPINLOCK_H
++#define __LINUX_RQSPINLOCK_H
++
++#include "../locking/qspinlock.h"
++
++/*
++ * try_cmpxchg_tail - Return result of cmpxchg of tail word with a new value
++ * @lock: Pointer to queued spinlock structure
++ * @tail: The tail to compare against
++ * @new_tail: The new queue tail code word
++ * Return: Bool to indicate whether the cmpxchg operation succeeded
++ *
++ * This is used by the head of the wait queue to clean up the queue.
++ * Provides relaxed ordering, since observers only rely on initialized
++ * state of the node which was made visible through the xchg_tail operation,
++ * i.e. through the smp_wmb preceding xchg_tail.
++ *
++ * We avoid using 16-bit cmpxchg, which is not available on all architectures.
++ */
++static __always_inline bool try_cmpxchg_tail(struct qspinlock *lock, u32 tail, u32 new_tail)
++{
++	u32 old, new;
++
++	old = atomic_read(&lock->val);
++	do {
++		/*
++		 * Is the tail part we compare to already stale? Fail.
++		 */
++		if ((old & _Q_TAIL_MASK) != tail)
++			return false;
++		/*
++		 * Encode latest locked/pending state for new tail.
++		 */
++		new = (old & _Q_LOCKED_PENDING_MASK) | new_tail;
++	} while (!atomic_try_cmpxchg_relaxed(&lock->val, &old, new));
++
++	return true;
++}
++
++#endif /* __LINUX_RQSPINLOCK_H */
+-- 
+cgit 1.2.3-korg
+
+
+From 3bb159366a13d8f5ead58f1cc1d0efa0183e951e Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:27 -0700
+Subject: rqspinlock: Protect waiters in trylock fallback from stalls
+
+When we run out of maximum rqnodes, the original queued spin lock slow
+path falls back to a try lock. In such a case, we are again susceptible
+to stalls in case the lock owner fails to make progress. We use the
+timeout as a fallback to break out of this loop and return to the
+caller. This is a fallback for an extreme edge case, when on the same
+CPU we run out of all 4 qnodes. When could this happen? We are in slow
+path in task context, we get interrupted by an IRQ, which while in the
+slow path gets interrupted by an NMI, whcih in the slow path gets
+another nested NMI, which enters the slow path. All of the interruptions
+happen after node->count++.
+
+We use RES_DEF_TIMEOUT as our spinning duration, but in the case of this
+fallback, no fairness is guaranteed, so the duration may be too small
+for contended cases, as the waiting time is not bounded. Since this is
+an extreme corner case, let's just prefer timing out instead of
+attempting to spin for longer.
+
+Reviewed-by: Barret Rhoden <brho@google.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-12-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/rqspinlock.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 65c2b41d89373f..361d452f027c11 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -275,8 +275,14 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ 	if (unlikely(idx >= _Q_MAX_NODES)) {
+ 		lockevent_inc(lock_no_node);
+-		while (!queued_spin_trylock(lock))
++		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
++		while (!queued_spin_trylock(lock)) {
++			if (RES_CHECK_TIMEOUT(ts, ret)) {
++				lockevent_inc(rqspinlock_lock_timeout);
++				break;
++			}
+ 			cpu_relax();
++		}
+ 		goto release;
+ 	}
+ 
+-- 
+cgit 1.2.3-korg
+
+
+From 31158ad02ddbed2b0672c9701a0a2f3e5b3bc01a Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:28 -0700
+Subject: rqspinlock: Add deadlock detection and recovery
+
+While the timeout logic provides guarantees for the waiter's forward
+progress, the time until a stalling waiter unblocks can still be long.
+The default timeout of 1/4 sec can be excessively long for some use
+cases.  Additionally, custom timeouts may exacerbate recovery time.
+
+Introduce logic to detect common cases of deadlocks and perform quicker
+recovery. This is done by dividing the time from entry into the locking
+slow path until the timeout into intervals of 1 ms. Then, after each
+interval elapses, deadlock detection is performed, while also polling
+the lock word to ensure we can quickly break out of the detection logic
+and proceed with lock acquisition.
+
+A 'held_locks' table is maintained per-CPU where the entry at the bottom
+denotes a lock being waited for or already taken. Entries coming before
+it denote locks that are already held. The current CPU's table can thus
+be looked at to detect AA deadlocks. The tables from other CPUs can be
+looked at to discover ABBA situations. Finally, when a matching entry
+for the lock being taken on the current CPU is found on some other CPU,
+a deadlock situation is detected. This function can take a long time,
+therefore the lock word is constantly polled in each loop iteration to
+ensure we can preempt detection and proceed with lock acquisition, using
+the is_lock_released check.
+
+We set 'spin' member of rqspinlock_timeout struct to 0 to trigger
+deadlock checks immediately to perform faster recovery.
+
+Note: Extending lock word size by 4 bytes to record owner CPU can allow
+faster detection for ABBA. It is typically the owner which participates
+in a ABBA situation. However, to keep compatibility with existing lock
+words in the kernel (struct qspinlock), and given deadlocks are a rare
+event triggered by bugs, we choose to favor compatibility over faster
+detection.
+
+The release_held_lock_entry function requires an smp_wmb, while the
+release store on unlock will provide the necessary ordering for us. Add
+comments to document the subtleties of why this is correct. It is
+possible for stores to be reordered still, but in the context of the
+deadlock detection algorithm, a release barrier is sufficient and
+needn't be stronger for unlock's case.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-13-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h | 100 +++++++++++++++++++++
+ kernel/bpf/rqspinlock.c          | 187 ++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 273 insertions(+), 14 deletions(-)
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index 9bd11cb7acd60c..34c3dcb4299e84 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/types.h>
+ #include <vdso/time64.h>
++#include <linux/percpu.h>
+ 
+ struct qspinlock;
+ typedef struct qspinlock rqspinlock_t;
+@@ -22,4 +23,103 @@ extern int resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
+  */
+ #define RES_DEF_TIMEOUT (NSEC_PER_SEC / 4)
+ 
++/*
++ * Choose 31 as it makes rqspinlock_held cacheline-aligned.
++ */
++#define RES_NR_HELD 31
++
++struct rqspinlock_held {
++	int cnt;
++	void *locks[RES_NR_HELD];
++};
++
++DECLARE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks);
++
++static __always_inline void grab_held_lock_entry(void *lock)
++{
++	int cnt = this_cpu_inc_return(rqspinlock_held_locks.cnt);
++
++	if (unlikely(cnt > RES_NR_HELD)) {
++		/* Still keep the inc so we decrement later. */
++		return;
++	}
++
++	/*
++	 * Implied compiler barrier in per-CPU operations; otherwise we can have
++	 * the compiler reorder inc with write to table, allowing interrupts to
++	 * overwrite and erase our write to the table (as on interrupt exit it
++	 * will be reset to NULL).
++	 *
++	 * It is fine for cnt inc to be reordered wrt remote readers though,
++	 * they won't observe our entry until the cnt update is visible, that's
++	 * all.
++	 */
++	this_cpu_write(rqspinlock_held_locks.locks[cnt - 1], lock);
++}
++
++/*
++ * We simply don't support out-of-order unlocks, and keep the logic simple here.
++ * The verifier prevents BPF programs from unlocking out-of-order, and the same
++ * holds for in-kernel users.
++ *
++ * It is possible to run into misdetection scenarios of AA deadlocks on the same
++ * CPU, and missed ABBA deadlocks on remote CPUs if this function pops entries
++ * out of order (due to lock A, lock B, unlock A, unlock B) pattern. The correct
++ * logic to preserve right entries in the table would be to walk the array of
++ * held locks and swap and clear out-of-order entries, but that's too
++ * complicated and we don't have a compelling use case for out of order unlocking.
++ */
++static __always_inline void release_held_lock_entry(void)
++{
++	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
++
++	if (unlikely(rqh->cnt > RES_NR_HELD))
++		goto dec;
++	WRITE_ONCE(rqh->locks[rqh->cnt - 1], NULL);
++dec:
++	/*
++	 * Reordering of clearing above with inc and its write in
++	 * grab_held_lock_entry that came before us (in same acquisition
++	 * attempt) is ok, we either see a valid entry or NULL when it's
++	 * visible.
++	 *
++	 * But this helper is invoked when we unwind upon failing to acquire the
++	 * lock. Unlike the unlock path which constitutes a release store after
++	 * we clear the entry, we need to emit a write barrier here. Otherwise,
++	 * we may have a situation as follows:
++	 *
++	 * <error> for lock B
++	 * release_held_lock_entry
++	 *
++	 * try_cmpxchg_acquire for lock A
++	 * grab_held_lock_entry
++	 *
++	 * Lack of any ordering means reordering may occur such that dec, inc
++	 * are done before entry is overwritten. This permits a remote lock
++	 * holder of lock B (which this CPU failed to acquire) to now observe it
++	 * as being attempted on this CPU, and may lead to misdetection (if this
++	 * CPU holds a lock it is attempting to acquire, leading to false ABBA
++	 * diagnosis).
++	 *
++	 * In case of unlock, we will always do a release on the lock word after
++	 * releasing the entry, ensuring that other CPUs cannot hold the lock
++	 * (and make conclusions about deadlocks) until the entry has been
++	 * cleared on the local CPU, preventing any anomalies. Reordering is
++	 * still possible there, but a remote CPU cannot observe a lock in our
++	 * table which it is already holding, since visibility entails our
++	 * release store for the said lock has not retired.
++	 *
++	 * In theory we don't have a problem if the dec and WRITE_ONCE above get
++	 * reordered with each other, we either notice an empty NULL entry on
++	 * top (if dec succeeds WRITE_ONCE), or a potentially stale entry which
++	 * cannot be observed (if dec precedes WRITE_ONCE).
++	 *
++	 * Emit the write barrier _before_ the dec, this permits dec-inc
++	 * reordering but that is harmless as we'd have new entry set to NULL
++	 * already, i.e. they cannot precede the NULL store above.
++	 */
++	smp_wmb();
++	this_cpu_dec(rqspinlock_held_locks.cnt);
++}
++
+ #endif /* __ASM_GENERIC_RQSPINLOCK_H */
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 361d452f027c11..bddbcc47d38fc7 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -31,6 +31,7 @@
+  */
+ #include "../locking/qspinlock.h"
+ #include "../locking/lock_events.h"
++#include "rqspinlock.h"
+ 
+ /*
+  * The basic principle of a queue-based spinlock can best be understood
+@@ -74,16 +75,147 @@
+ struct rqspinlock_timeout {
+ 	u64 timeout_end;
+ 	u64 duration;
++	u64 cur;
+ 	u16 spin;
+ };
+ 
+ #define RES_TIMEOUT_VAL	2
+ 
+-static noinline int check_timeout(struct rqspinlock_timeout *ts)
++DEFINE_PER_CPU_ALIGNED(struct rqspinlock_held, rqspinlock_held_locks);
++EXPORT_SYMBOL_GPL(rqspinlock_held_locks);
++
++static bool is_lock_released(rqspinlock_t *lock, u32 mask, struct rqspinlock_timeout *ts)
++{
++	if (!(atomic_read_acquire(&lock->val) & (mask)))
++		return true;
++	return false;
++}
++
++static noinline int check_deadlock_AA(rqspinlock_t *lock, u32 mask,
++				      struct rqspinlock_timeout *ts)
++{
++	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
++	int cnt = min(RES_NR_HELD, rqh->cnt);
++
++	/*
++	 * Return an error if we hold the lock we are attempting to acquire.
++	 * We'll iterate over max 32 locks; no need to do is_lock_released.
++	 */
++	for (int i = 0; i < cnt - 1; i++) {
++		if (rqh->locks[i] == lock)
++			return -EDEADLK;
++	}
++	return 0;
++}
++
++/*
++ * This focuses on the most common case of ABBA deadlocks (or ABBA involving
++ * more locks, which reduce to ABBA). This is not exhaustive, and we rely on
++ * timeouts as the final line of defense.
++ */
++static noinline int check_deadlock_ABBA(rqspinlock_t *lock, u32 mask,
++					struct rqspinlock_timeout *ts)
++{
++	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
++	int rqh_cnt = min(RES_NR_HELD, rqh->cnt);
++	void *remote_lock;
++	int cpu;
++
++	/*
++	 * Find the CPU holding the lock that we want to acquire. If there is a
++	 * deadlock scenario, we will read a stable set on the remote CPU and
++	 * find the target. This would be a constant time operation instead of
++	 * O(NR_CPUS) if we could determine the owning CPU from a lock value, but
++	 * that requires increasing the size of the lock word.
++	 */
++	for_each_possible_cpu(cpu) {
++		struct rqspinlock_held *rqh_cpu = per_cpu_ptr(&rqspinlock_held_locks, cpu);
++		int real_cnt = READ_ONCE(rqh_cpu->cnt);
++		int cnt = min(RES_NR_HELD, real_cnt);
++
++		/*
++		 * Let's ensure to break out of this loop if the lock is available for
++		 * us to potentially acquire.
++		 */
++		if (is_lock_released(lock, mask, ts))
++			return 0;
++
++		/*
++		 * Skip ourselves, and CPUs whose count is less than 2, as they need at
++		 * least one held lock and one acquisition attempt (reflected as top
++		 * most entry) to participate in an ABBA deadlock.
++		 *
++		 * If cnt is more than RES_NR_HELD, it means the current lock being
++		 * acquired won't appear in the table, and other locks in the table are
++		 * already held, so we can't determine ABBA.
++		 */
++		if (cpu == smp_processor_id() || real_cnt < 2 || real_cnt > RES_NR_HELD)
++			continue;
++
++		/*
++		 * Obtain the entry at the top, this corresponds to the lock the
++		 * remote CPU is attempting to acquire in a deadlock situation,
++		 * and would be one of the locks we hold on the current CPU.
++		 */
++		remote_lock = READ_ONCE(rqh_cpu->locks[cnt - 1]);
++		/*
++		 * If it is NULL, we've raced and cannot determine a deadlock
++		 * conclusively, skip this CPU.
++		 */
++		if (!remote_lock)
++			continue;
++		/*
++		 * Find if the lock we're attempting to acquire is held by this CPU.
++		 * Don't consider the topmost entry, as that must be the latest lock
++		 * being held or acquired.  For a deadlock, the target CPU must also
++		 * attempt to acquire a lock we hold, so for this search only 'cnt - 1'
++		 * entries are important.
++		 */
++		for (int i = 0; i < cnt - 1; i++) {
++			if (READ_ONCE(rqh_cpu->locks[i]) != lock)
++				continue;
++			/*
++			 * We found our lock as held on the remote CPU.  Is the
++			 * acquisition attempt on the remote CPU for a lock held
++			 * by us?  If so, we have a deadlock situation, and need
++			 * to recover.
++			 */
++			for (int i = 0; i < rqh_cnt - 1; i++) {
++				if (rqh->locks[i] == remote_lock)
++					return -EDEADLK;
++			}
++			/*
++			 * Inconclusive; retry again later.
++			 */
++			return 0;
++		}
++	}
++	return 0;
++}
++
++static noinline int check_deadlock(rqspinlock_t *lock, u32 mask,
++				   struct rqspinlock_timeout *ts)
++{
++	int ret;
++
++	ret = check_deadlock_AA(lock, mask, ts);
++	if (ret)
++		return ret;
++	ret = check_deadlock_ABBA(lock, mask, ts);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
++				  struct rqspinlock_timeout *ts)
+ {
+ 	u64 time = ktime_get_mono_fast_ns();
++	u64 prev = ts->cur;
+ 
+ 	if (!ts->timeout_end) {
++		ts->cur = time;
+ 		ts->timeout_end = time + ts->duration;
+ 		return 0;
+ 	}
+@@ -91,6 +223,15 @@ static noinline int check_timeout(struct rqspinlock_timeout *ts)
+ 	if (time > ts->timeout_end)
+ 		return -ETIMEDOUT;
+ 
++	/*
++	 * A millisecond interval passed from last time? Trigger deadlock
++	 * checks.
++	 */
++	if (prev + NSEC_PER_MSEC < time) {
++		ts->cur = time;
++		return check_deadlock(lock, mask, ts);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -99,21 +240,22 @@ static noinline int check_timeout(struct rqspinlock_timeout *ts)
+  * as the macro does internal amortization for us.
+  */
+ #ifndef res_smp_cond_load_acquire
+-#define RES_CHECK_TIMEOUT(ts, ret)                    \
+-	({                                            \
+-		if (!(ts).spin++)                     \
+-			(ret) = check_timeout(&(ts)); \
+-		(ret);                                \
++#define RES_CHECK_TIMEOUT(ts, ret, mask)                              \
++	({                                                            \
++		if (!(ts).spin++)                                     \
++			(ret) = check_timeout((lock), (mask), &(ts)); \
++		(ret);                                                \
+ 	})
+ #else
+-#define RES_CHECK_TIMEOUT(ts, ret, mask)	      \
++#define RES_CHECK_TIMEOUT(ts, ret, mask)			      \
+ 	({ (ret) = check_timeout(&(ts)); })
+ #endif
+ 
+ /*
+  * Initialize the 'spin' member.
++ * Set spin member to 0 to trigger AA/ABBA checks immediately.
+  */
+-#define RES_INIT_TIMEOUT(ts) ({ (ts).spin = 1; })
++#define RES_INIT_TIMEOUT(ts) ({ (ts).spin = 0; })
+ 
+ /*
+  * We only need to reset 'timeout_end', 'spin' will just wrap around as necessary.
+@@ -142,6 +284,7 @@ static DEFINE_PER_CPU_ALIGNED(struct qnode, rqnodes[_Q_MAX_NODES]);
+  *
+  * Return:
+  * * 0		- Lock was acquired successfully.
++ * * -EDEADLK	- Lock acquisition failed because of AA/ABBA deadlock.
+  * * -ETIMEDOUT - Lock acquisition failed because of timeout.
+  *
+  * (queue tail, pending bit, lock value)
+@@ -212,6 +355,11 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 		goto queue;
+ 	}
+ 
++	/*
++	 * Grab an entry in the held locks array, to enable deadlock detection.
++	 */
++	grab_held_lock_entry(lock);
++
+ 	/*
+ 	 * We're pending, wait for the owner to go away.
+ 	 *
+@@ -225,7 +373,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ 	if (val & _Q_LOCKED_MASK) {
+ 		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
+-		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret));
++		res_smp_cond_load_acquire(&lock->locked, !VAL || RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_MASK));
+ 	}
+ 
+ 	if (ret) {
+@@ -240,7 +388,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 		 */
+ 		clear_pending(lock);
+ 		lockevent_inc(rqspinlock_lock_timeout);
+-		return ret;
++		goto err_release_entry;
+ 	}
+ 
+ 	/*
+@@ -258,6 +406,11 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ queue:
+ 	lockevent_inc(lock_slowpath);
++	/*
++	 * Grab deadlock detection entry for the queue path.
++	 */
++	grab_held_lock_entry(lock);
++
+ 	node = this_cpu_ptr(&rqnodes[0].mcs);
+ 	idx = node->count++;
+ 	tail = encode_tail(smp_processor_id(), idx);
+@@ -277,9 +430,9 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 		lockevent_inc(lock_no_node);
+ 		RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT);
+ 		while (!queued_spin_trylock(lock)) {
+-			if (RES_CHECK_TIMEOUT(ts, ret)) {
++			if (RES_CHECK_TIMEOUT(ts, ret, ~0u)) {
+ 				lockevent_inc(rqspinlock_lock_timeout);
+-				break;
++				goto err_release_node;
+ 			}
+ 			cpu_relax();
+ 		}
+@@ -375,7 +528,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ 	RES_RESET_TIMEOUT(ts, RES_DEF_TIMEOUT * 2);
+ 	val = res_atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK) ||
+-					   RES_CHECK_TIMEOUT(ts, ret));
++					   RES_CHECK_TIMEOUT(ts, ret, _Q_LOCKED_PENDING_MASK));
+ 
+ waitq_timeout:
+ 	if (ret) {
+@@ -408,7 +561,7 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 			WRITE_ONCE(next->locked, RES_TIMEOUT_VAL);
+ 		}
+ 		lockevent_inc(rqspinlock_lock_timeout);
+-		goto release;
++		goto err_release_node;
+ 	}
+ 
+ 	/*
+@@ -455,5 +608,11 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	 */
+ 	__this_cpu_dec(rqnodes[0].mcs.count);
+ 	return ret;
++err_release_node:
++	trace_contention_end(lock, ret);
++	__this_cpu_dec(rqnodes[0].mcs.count);
++err_release_entry:
++	release_held_lock_entry();
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
+-- 
+cgit 1.2.3-korg
+
+
+From c9102a68c070134ade5c941d7315481a77bcea53 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:29 -0700
+Subject: rqspinlock: Add a test-and-set fallback
+
+Include a test-and-set fallback when queued spinlock support is not
+available. Introduce a rqspinlock type to act as a fallback when
+qspinlock support is absent.
+
+Include ifdef guards to ensure the slow path in this file is only
+compiled when CONFIG_QUEUED_SPINLOCKS=y. Subsequent patches will add
+further logic to ensure fallback to the test-and-set implementation
+when queued spinlock support is unavailable on an architecture.
+
+Unlike other waiting loops in rqspinlock code, the one for test-and-set
+has no theoretical upper bound under contention, therefore we need a
+longer timeout than usual. Bump it up to a second in this case.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-14-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h | 17 +++++++++++++++
+ kernel/bpf/rqspinlock.c          | 46 ++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index 34c3dcb4299e84..12f72c4a97cdee 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -12,11 +12,28 @@
+ #include <linux/types.h>
+ #include <vdso/time64.h>
+ #include <linux/percpu.h>
++#ifdef CONFIG_QUEUED_SPINLOCKS
++#include <asm/qspinlock.h>
++#endif
++
++struct rqspinlock {
++	union {
++		atomic_t val;
++		u32 locked;
++	};
++};
+ 
+ struct qspinlock;
++#ifdef CONFIG_QUEUED_SPINLOCKS
+ typedef struct qspinlock rqspinlock_t;
++#else
++typedef struct rqspinlock rqspinlock_t;
++#endif
+ 
++extern int resilient_tas_spin_lock(rqspinlock_t *lock);
++#ifdef CONFIG_QUEUED_SPINLOCKS
+ extern int resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
++#endif
+ 
+ /*
+  * Default timeout for waiting loops is 0.25 seconds
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index bddbcc47d38fc7..714dfab5caa83d 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -21,7 +21,9 @@
+ #include <linux/mutex.h>
+ #include <linux/prefetch.h>
+ #include <asm/byteorder.h>
++#ifdef CONFIG_QUEUED_SPINLOCKS
+ #include <asm/qspinlock.h>
++#endif
+ #include <trace/events/lock.h>
+ #include <asm/rqspinlock.h>
+ #include <linux/timekeeping.h>
+@@ -29,9 +31,12 @@
+ /*
+  * Include queued spinlock definitions and statistics code
+  */
++#ifdef CONFIG_QUEUED_SPINLOCKS
+ #include "../locking/qspinlock.h"
+ #include "../locking/lock_events.h"
+ #include "rqspinlock.h"
++#include "../locking/mcs_spinlock.h"
++#endif
+ 
+ /*
+  * The basic principle of a queue-based spinlock can best be understood
+@@ -70,8 +75,6 @@
+  *
+  */
+ 
+-#include "../locking/mcs_spinlock.h"
+-
+ struct rqspinlock_timeout {
+ 	u64 timeout_end;
+ 	u64 duration;
+@@ -263,6 +266,43 @@ static noinline int check_timeout(rqspinlock_t *lock, u32 mask,
+  */
+ #define RES_RESET_TIMEOUT(ts, _duration) ({ (ts).timeout_end = 0; (ts).duration = _duration; })
+ 
++/*
++ * Provide a test-and-set fallback for cases when queued spin lock support is
++ * absent from the architecture.
++ */
++int __lockfunc resilient_tas_spin_lock(rqspinlock_t *lock)
++{
++	struct rqspinlock_timeout ts;
++	int val, ret = 0;
++
++	RES_INIT_TIMEOUT(ts);
++	grab_held_lock_entry(lock);
++
++	/*
++	 * Since the waiting loop's time is dependent on the amount of
++	 * contention, a short timeout unlike rqspinlock waiting loops
++	 * isn't enough. Choose a second as the timeout value.
++	 */
++	RES_RESET_TIMEOUT(ts, NSEC_PER_SEC);
++retry:
++	val = atomic_read(&lock->val);
++
++	if (val || !atomic_try_cmpxchg(&lock->val, &val, 1)) {
++		if (RES_CHECK_TIMEOUT(ts, ret, ~0u))
++			goto out;
++		cpu_relax();
++		goto retry;
++	}
++
++	return 0;
++out:
++	release_held_lock_entry();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(resilient_tas_spin_lock);
++
++#ifdef CONFIG_QUEUED_SPINLOCKS
++
+ /*
+  * Per-CPU queue node structures; we can never have more than 4 nested
+  * contexts: task, softirq, hardirq, nmi.
+@@ -616,3 +656,5 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
++
++#endif /* CONFIG_QUEUED_SPINLOCKS */
+-- 
+cgit 1.2.3-korg
+
+
+From ecbd8047526d3e9681043c287dea7bc67ef33eb4 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:30 -0700
+Subject: rqspinlock: Add basic support for CONFIG_PARAVIRT
+
+We ripped out PV and virtualization related bits from rqspinlock in an
+earlier commit, however, a fair lock performs poorly within a virtual
+machine when the lock holder is preempted. As such, retain the
+virt_spin_lock fallback to test and set lock, but with timeout and
+deadlock detection. We can do this by simply depending on the
+resilient_tas_spin_lock implementation from the previous patch.
+
+We don't integrate support for CONFIG_PARAVIRT_SPINLOCKS yet, as that
+requires more involved algorithmic changes and introduces more
+complexity. It can be done when the need arises in the future.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-15-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ arch/x86/include/asm/rqspinlock.h | 33 +++++++++++++++++++++++++++++++++
+ include/asm-generic/rqspinlock.h  | 14 ++++++++++++++
+ kernel/bpf/rqspinlock.c           |  3 +++
+ 3 files changed, 50 insertions(+)
+ create mode 100644 arch/x86/include/asm/rqspinlock.h
+
+diff --git a/arch/x86/include/asm/rqspinlock.h b/arch/x86/include/asm/rqspinlock.h
+new file mode 100644
+index 00000000000000..24a885449ee6ab
+--- /dev/null
++++ b/arch/x86/include/asm/rqspinlock.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_RQSPINLOCK_H
++#define _ASM_X86_RQSPINLOCK_H
++
++#include <asm/paravirt.h>
++
++#ifdef CONFIG_PARAVIRT
++DECLARE_STATIC_KEY_FALSE(virt_spin_lock_key);
++
++#define resilient_virt_spin_lock_enabled resilient_virt_spin_lock_enabled
++static __always_inline bool resilient_virt_spin_lock_enabled(void)
++{
++       return static_branch_likely(&virt_spin_lock_key);
++}
++
++#ifdef CONFIG_QUEUED_SPINLOCKS
++typedef struct qspinlock rqspinlock_t;
++#else
++typedef struct rqspinlock rqspinlock_t;
++#endif
++extern int resilient_tas_spin_lock(rqspinlock_t *lock);
++
++#define resilient_virt_spin_lock resilient_virt_spin_lock
++static inline int resilient_virt_spin_lock(rqspinlock_t *lock)
++{
++	return resilient_tas_spin_lock(lock);
++}
++
++#endif /* CONFIG_PARAVIRT */
++
++#include <asm-generic/rqspinlock.h>
++
++#endif /* _ASM_X86_RQSPINLOCK_H */
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index 12f72c4a97cdee..a837c6b6abd9a9 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -35,6 +35,20 @@ extern int resilient_tas_spin_lock(rqspinlock_t *lock);
+ extern int resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val);
+ #endif
+ 
++#ifndef resilient_virt_spin_lock_enabled
++static __always_inline bool resilient_virt_spin_lock_enabled(void)
++{
++	return false;
++}
++#endif
++
++#ifndef resilient_virt_spin_lock
++static __always_inline int resilient_virt_spin_lock(rqspinlock_t *lock)
++{
++	return 0;
++}
++#endif
++
+ /*
+  * Default timeout for waiting loops is 0.25 seconds
+  */
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index 714dfab5caa83d..ed21ee0100633e 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -352,6 +352,9 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ 
+ 	BUILD_BUG_ON(CONFIG_NR_CPUS >= (1U << _Q_TAIL_CPU_BITS));
+ 
++	if (resilient_virt_spin_lock_enabled())
++		return resilient_virt_spin_lock(lock);
++
+ 	RES_INIT_TIMEOUT(ts);
+ 
+ 	/*
+-- 
+cgit 1.2.3-korg
+
+
+From 101acd2e78b1b63708ca527ca98e57b1ff2a9534 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:32 -0700
+Subject: rqspinlock: Add macros for rqspinlock usage
+
+Introduce helper macros that wrap around the rqspinlock slow path and
+provide an interface analogous to the raw_spin_lock API. Note that
+in case of error conditions, preemption and IRQ disabling is
+automatically unrolled before returning the error back to the caller.
+
+Ensure that in absence of CONFIG_QUEUED_SPINLOCKS support, we fallback
+to the test-and-set implementation.
+
+Add some comments describing the subtle memory ordering logic during
+unlock, and why it's safe.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-17-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h | 87 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 87 insertions(+)
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index a837c6b6abd9a9..23abd0b8d0f9f5 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -153,4 +153,91 @@ static __always_inline void release_held_lock_entry(void)
+ 	this_cpu_dec(rqspinlock_held_locks.cnt);
+ }
+ 
++#ifdef CONFIG_QUEUED_SPINLOCKS
++
++/**
++ * res_spin_lock - acquire a queued spinlock
++ * @lock: Pointer to queued spinlock structure
++ *
++ * Return:
++ * * 0		- Lock was acquired successfully.
++ * * -EDEADLK	- Lock acquisition failed because of AA/ABBA deadlock.
++ * * -ETIMEDOUT - Lock acquisition failed because of timeout.
++ */
++static __always_inline int res_spin_lock(rqspinlock_t *lock)
++{
++	int val = 0;
++
++	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))) {
++		grab_held_lock_entry(lock);
++		return 0;
++	}
++	return resilient_queued_spin_lock_slowpath(lock, val);
++}
++
++#else
++
++#define res_spin_lock(lock) resilient_tas_spin_lock(lock)
++
++#endif /* CONFIG_QUEUED_SPINLOCKS */
++
++static __always_inline void res_spin_unlock(rqspinlock_t *lock)
++{
++	struct rqspinlock_held *rqh = this_cpu_ptr(&rqspinlock_held_locks);
++
++	if (unlikely(rqh->cnt > RES_NR_HELD))
++		goto unlock;
++	WRITE_ONCE(rqh->locks[rqh->cnt - 1], NULL);
++unlock:
++	/*
++	 * Release barrier, ensures correct ordering. See release_held_lock_entry
++	 * for details.  Perform release store instead of queued_spin_unlock,
++	 * since we use this function for test-and-set fallback as well. When we
++	 * have CONFIG_QUEUED_SPINLOCKS=n, we clear the full 4-byte lockword.
++	 *
++	 * Like release_held_lock_entry, we can do the release before the dec.
++	 * We simply care about not seeing the 'lock' in our table from a remote
++	 * CPU once the lock has been released, which doesn't rely on the dec.
++	 *
++	 * Unlike smp_wmb(), release is not a two way fence, hence it is
++	 * possible for a inc to move up and reorder with our clearing of the
++	 * entry. This isn't a problem however, as for a misdiagnosis of ABBA,
++	 * the remote CPU needs to hold this lock, which won't be released until
++	 * the store below is done, which would ensure the entry is overwritten
++	 * to NULL, etc.
++	 */
++	smp_store_release(&lock->locked, 0);
++	this_cpu_dec(rqspinlock_held_locks.cnt);
++}
++
++#ifdef CONFIG_QUEUED_SPINLOCKS
++#define raw_res_spin_lock_init(lock) ({ *(lock) = (rqspinlock_t)__ARCH_SPIN_LOCK_UNLOCKED; })
++#else
++#define raw_res_spin_lock_init(lock) ({ *(lock) = (rqspinlock_t){0}; })
++#endif
++
++#define raw_res_spin_lock(lock)                    \
++	({                                         \
++		int __ret;                         \
++		preempt_disable();                 \
++		__ret = res_spin_lock(lock);	   \
++		if (__ret)                         \
++			preempt_enable();          \
++		__ret;                             \
++	})
++
++#define raw_res_spin_unlock(lock) ({ res_spin_unlock(lock); preempt_enable(); })
++
++#define raw_res_spin_lock_irqsave(lock, flags)    \
++	({                                        \
++		int __ret;                        \
++		local_irq_save(flags);            \
++		__ret = raw_res_spin_lock(lock);  \
++		if (__ret)                        \
++			local_irq_restore(flags); \
++		__ret;                            \
++	})
++
++#define raw_res_spin_unlock_irqrestore(lock, flags) ({ raw_res_spin_unlock(lock); local_irq_restore(flags); })
++
+ #endif /* __ASM_GENERIC_RQSPINLOCK_H */
+-- 
+cgit 1.2.3-korg
+
+
+From e2082e32fd57976e811086708043c136ee596978 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:33 -0700
+Subject: rqspinlock: Add entry to Makefile, MAINTAINERS
+
+Ensure that the rqspinlock code is only built when the BPF subsystem is
+compiled in. Depending on queued spinlock support, we may or may not end
+up building the queued spinlock slowpath, and instead fallback to the
+test-and-set implementation. Also add entries to MAINTAINERS file.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-18-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ MAINTAINERS                | 2 ++
+ include/asm-generic/Kbuild | 1 +
+ kernel/bpf/Makefile        | 2 +-
+ 3 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 3864d473f52f2a..c545cd149cd161 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -4297,6 +4297,8 @@ F:	include/uapi/linux/filter.h
+ F:	kernel/bpf/
+ F:	kernel/trace/bpf_trace.c
+ F:	lib/buildid.c
++F:	arch/*/include/asm/rqspinlock.h
++F:	include/asm-generic/rqspinlock.h
+ F:	lib/test_bpf.c
+ F:	net/bpf/
+ F:	net/core/filter.c
+diff --git a/include/asm-generic/Kbuild b/include/asm-generic/Kbuild
+index 1b43c3a77012db..8675b7b4ad23ed 100644
+--- a/include/asm-generic/Kbuild
++++ b/include/asm-generic/Kbuild
+@@ -45,6 +45,7 @@ mandatory-y += pci.h
+ mandatory-y += percpu.h
+ mandatory-y += pgalloc.h
+ mandatory-y += preempt.h
++mandatory-y += rqspinlock.h
+ mandatory-y += runtime-const.h
+ mandatory-y += rwonce.h
+ mandatory-y += sections.h
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index 410028633621c1..70502f038b9218 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -14,7 +14,7 @@ obj-$(CONFIG_BPF_SYSCALL) += bpf_local_storage.o bpf_task_storage.o
+ obj-${CONFIG_BPF_LSM}	  += bpf_inode_storage.o
+ obj-$(CONFIG_BPF_SYSCALL) += disasm.o mprog.o
+ obj-$(CONFIG_BPF_JIT) += trampoline.o
+-obj-$(CONFIG_BPF_SYSCALL) += btf.o memalloc.o
++obj-$(CONFIG_BPF_SYSCALL) += btf.o memalloc.o rqspinlock.o
+ ifeq ($(CONFIG_MMU)$(CONFIG_64BIT),yy)
+ obj-$(CONFIG_BPF_SYSCALL) += arena.o range_tree.o
+ endif
+-- 
+cgit 1.2.3-korg
+
+
+From a6884f6f1dd565be0ba1462ab1f66ba8f211d746 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:34 -0700
+Subject: rqspinlock: Add locktorture support
+
+Introduce locktorture support for rqspinlock using the newly added
+macros as the first in-kernel user and consumer. Guard the code with
+CONFIG_BPF_SYSCALL ifdef since rqspinlock is not available otherwise.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-19-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/locking/locktorture.c | 57 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/kernel/locking/locktorture.c b/kernel/locking/locktorture.c
+index cc33470f4de97b..ce0362f0a8719a 100644
+--- a/kernel/locking/locktorture.c
++++ b/kernel/locking/locktorture.c
+@@ -362,6 +362,60 @@ static struct lock_torture_ops raw_spin_lock_irq_ops = {
+ 	.name		= "raw_spin_lock_irq"
+ };
+ 
++#ifdef CONFIG_BPF_SYSCALL
++
++#include <asm/rqspinlock.h>
++static rqspinlock_t rqspinlock;
++
++static int torture_raw_res_spin_write_lock(int tid __maybe_unused)
++{
++	raw_res_spin_lock(&rqspinlock);
++	return 0;
++}
++
++static void torture_raw_res_spin_write_unlock(int tid __maybe_unused)
++{
++	raw_res_spin_unlock(&rqspinlock);
++}
++
++static struct lock_torture_ops raw_res_spin_lock_ops = {
++	.writelock	= torture_raw_res_spin_write_lock,
++	.write_delay	= torture_spin_lock_write_delay,
++	.task_boost     = torture_rt_boost,
++	.writeunlock	= torture_raw_res_spin_write_unlock,
++	.readlock       = NULL,
++	.read_delay     = NULL,
++	.readunlock     = NULL,
++	.name		= "raw_res_spin_lock"
++};
++
++static int torture_raw_res_spin_write_lock_irq(int tid __maybe_unused)
++{
++	unsigned long flags;
++
++	raw_res_spin_lock_irqsave(&rqspinlock, flags);
++	cxt.cur_ops->flags = flags;
++	return 0;
++}
++
++static void torture_raw_res_spin_write_unlock_irq(int tid __maybe_unused)
++{
++	raw_res_spin_unlock_irqrestore(&rqspinlock, cxt.cur_ops->flags);
++}
++
++static struct lock_torture_ops raw_res_spin_lock_irq_ops = {
++	.writelock	= torture_raw_res_spin_write_lock_irq,
++	.write_delay	= torture_spin_lock_write_delay,
++	.task_boost     = torture_rt_boost,
++	.writeunlock	= torture_raw_res_spin_write_unlock_irq,
++	.readlock       = NULL,
++	.read_delay     = NULL,
++	.readunlock     = NULL,
++	.name		= "raw_res_spin_lock_irq"
++};
++
++#endif
++
+ static DEFINE_RWLOCK(torture_rwlock);
+ 
+ static int torture_rwlock_write_lock(int tid __maybe_unused)
+@@ -1168,6 +1222,9 @@ static int __init lock_torture_init(void)
+ 		&lock_busted_ops,
+ 		&spin_lock_ops, &spin_lock_irq_ops,
+ 		&raw_spin_lock_ops, &raw_spin_lock_irq_ops,
++#ifdef CONFIG_BPF_SYSCALL
++		&raw_res_spin_lock_ops, &raw_res_spin_lock_irq_ops,
++#endif
+ 		&rw_lock_ops, &rw_lock_irq_ops,
+ 		&mutex_lock_ops,
+ 		&ww_mutex_lock_ops,
+-- 
+cgit 1.2.3-korg
+
+
+From 4fa8d68aa53e6d76f66f3ed21e06c52cf8912074 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:35 -0700
+Subject: bpf: Convert hashtab.c to rqspinlock
+
+Convert hashtab.c from raw_spinlock to rqspinlock, and drop the hashed
+per-cpu counter crud from the code base which is no longer necessary.
+
+Closes: https://lore.kernel.org/bpf/675302fd.050a0220.2477f.0004.GAE@google.com
+Closes: https://lore.kernel.org/bpf/000000000000b3e63e061eed3f6b@google.com
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-20-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/hashtab.c | 102 ++++++++++++++++-----------------------------------
+ 1 file changed, 32 insertions(+), 70 deletions(-)
+
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 877298133fdae7..5a5adc66b8e224 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -16,6 +16,7 @@
+ #include "bpf_lru_list.h"
+ #include "map_in_map.h"
+ #include <linux/bpf_mem_alloc.h>
++#include <asm/rqspinlock.h>
+ 
+ #define HTAB_CREATE_FLAG_MASK						\
+ 	(BPF_F_NO_PREALLOC | BPF_F_NO_COMMON_LRU | BPF_F_NUMA_NODE |	\
+@@ -78,7 +79,7 @@
+  */
+ struct bucket {
+ 	struct hlist_nulls_head head;
+-	raw_spinlock_t raw_lock;
++	rqspinlock_t raw_lock;
+ };
+ 
+ #define HASHTAB_MAP_LOCK_COUNT 8
+@@ -104,8 +105,6 @@ struct bpf_htab {
+ 	u32 n_buckets;	/* number of hash buckets */
+ 	u32 elem_size;	/* size of each element in bytes */
+ 	u32 hashrnd;
+-	struct lock_class_key lockdep_key;
+-	int __percpu *map_locked[HASHTAB_MAP_LOCK_COUNT];
+ };
+ 
+ /* each htab element is struct htab_elem + key + value */
+@@ -140,45 +139,26 @@ static void htab_init_buckets(struct bpf_htab *htab)
+ 
+ 	for (i = 0; i < htab->n_buckets; i++) {
+ 		INIT_HLIST_NULLS_HEAD(&htab->buckets[i].head, i);
+-		raw_spin_lock_init(&htab->buckets[i].raw_lock);
+-		lockdep_set_class(&htab->buckets[i].raw_lock,
+-					  &htab->lockdep_key);
++		raw_res_spin_lock_init(&htab->buckets[i].raw_lock);
+ 		cond_resched();
+ 	}
+ }
+ 
+-static inline int htab_lock_bucket(const struct bpf_htab *htab,
+-				   struct bucket *b, u32 hash,
+-				   unsigned long *pflags)
++static inline int htab_lock_bucket(struct bucket *b, unsigned long *pflags)
+ {
+ 	unsigned long flags;
++	int ret;
+ 
+-	hash = hash & min_t(u32, HASHTAB_MAP_LOCK_MASK, htab->n_buckets - 1);
+-
+-	preempt_disable();
+-	local_irq_save(flags);
+-	if (unlikely(__this_cpu_inc_return(*(htab->map_locked[hash])) != 1)) {
+-		__this_cpu_dec(*(htab->map_locked[hash]));
+-		local_irq_restore(flags);
+-		preempt_enable();
+-		return -EBUSY;
+-	}
+-
+-	raw_spin_lock(&b->raw_lock);
++	ret = raw_res_spin_lock_irqsave(&b->raw_lock, flags);
++	if (ret)
++		return ret;
+ 	*pflags = flags;
+-
+ 	return 0;
+ }
+ 
+-static inline void htab_unlock_bucket(const struct bpf_htab *htab,
+-				      struct bucket *b, u32 hash,
+-				      unsigned long flags)
++static inline void htab_unlock_bucket(struct bucket *b, unsigned long flags)
+ {
+-	hash = hash & min_t(u32, HASHTAB_MAP_LOCK_MASK, htab->n_buckets - 1);
+-	raw_spin_unlock(&b->raw_lock);
+-	__this_cpu_dec(*(htab->map_locked[hash]));
+-	local_irq_restore(flags);
+-	preempt_enable();
++	raw_res_spin_unlock_irqrestore(&b->raw_lock, flags);
+ }
+ 
+ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node);
+@@ -483,14 +463,12 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 	bool percpu_lru = (attr->map_flags & BPF_F_NO_COMMON_LRU);
+ 	bool prealloc = !(attr->map_flags & BPF_F_NO_PREALLOC);
+ 	struct bpf_htab *htab;
+-	int err, i;
++	int err;
+ 
+ 	htab = bpf_map_area_alloc(sizeof(*htab), NUMA_NO_NODE);
+ 	if (!htab)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	lockdep_register_key(&htab->lockdep_key);
+-
+ 	bpf_map_init_from_attr(&htab->map, attr);
+ 
+ 	if (percpu_lru) {
+@@ -536,15 +514,6 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 	if (!htab->buckets)
+ 		goto free_elem_count;
+ 
+-	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++) {
+-		htab->map_locked[i] = bpf_map_alloc_percpu(&htab->map,
+-							   sizeof(int),
+-							   sizeof(int),
+-							   GFP_USER);
+-		if (!htab->map_locked[i])
+-			goto free_map_locked;
+-	}
+-
+ 	if (htab->map.map_flags & BPF_F_ZERO_SEED)
+ 		htab->hashrnd = 0;
+ 	else
+@@ -607,15 +576,12 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ free_map_locked:
+ 	if (htab->use_percpu_counter)
+ 		percpu_counter_destroy(&htab->pcount);
+-	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++)
+-		free_percpu(htab->map_locked[i]);
+ 	bpf_map_area_free(htab->buckets);
+ 	bpf_mem_alloc_destroy(&htab->pcpu_ma);
+ 	bpf_mem_alloc_destroy(&htab->ma);
+ free_elem_count:
+ 	bpf_map_free_elem_count(&htab->map);
+ free_htab:
+-	lockdep_unregister_key(&htab->lockdep_key);
+ 	bpf_map_area_free(htab);
+ 	return ERR_PTR(err);
+ }
+@@ -820,7 +786,7 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
+ 	b = __select_bucket(htab, tgt_l->hash);
+ 	head = &b->head;
+ 
+-	ret = htab_lock_bucket(htab, b, tgt_l->hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		return false;
+ 
+@@ -831,7 +797,7 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
+ 			break;
+ 		}
+ 
+-	htab_unlock_bucket(htab, b, tgt_l->hash, flags);
++	htab_unlock_bucket(b, flags);
+ 
+ 	if (l == tgt_l)
+ 		check_and_free_fields(htab, l);
+@@ -1150,7 +1116,7 @@ static long htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 		 */
+ 	}
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1201,7 +1167,7 @@ static long htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 			check_and_free_fields(htab, l_old);
+ 		}
+ 	}
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ 	if (l_old) {
+ 		if (old_map_ptr)
+ 			map->ops->map_fd_put_ptr(map, old_map_ptr, true);
+@@ -1210,7 +1176,7 @@ static long htab_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 	}
+ 	return 0;
+ err:
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ 	return ret;
+ }
+ 
+@@ -1257,7 +1223,7 @@ static long htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value
+ 	copy_map_value(&htab->map,
+ 		       l_new->key + round_up(map->key_size, 8), value);
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		goto err_lock_bucket;
+ 
+@@ -1278,7 +1244,7 @@ static long htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value
+ 	ret = 0;
+ 
+ err:
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ 
+ err_lock_bucket:
+ 	if (ret)
+@@ -1315,7 +1281,7 @@ static long __htab_percpu_map_update_elem(struct bpf_map *map, void *key,
+ 	b = __select_bucket(htab, hash);
+ 	head = &b->head;
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1340,7 +1306,7 @@ static long __htab_percpu_map_update_elem(struct bpf_map *map, void *key,
+ 	}
+ 	ret = 0;
+ err:
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ 	return ret;
+ }
+ 
+@@ -1381,7 +1347,7 @@ static long __htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
+ 			return -ENOMEM;
+ 	}
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		goto err_lock_bucket;
+ 
+@@ -1405,7 +1371,7 @@ static long __htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
+ 	}
+ 	ret = 0;
+ err:
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ err_lock_bucket:
+ 	if (l_new) {
+ 		bpf_map_dec_elem_count(&htab->map);
+@@ -1447,7 +1413,7 @@ static long htab_map_delete_elem(struct bpf_map *map, void *key)
+ 	b = __select_bucket(htab, hash);
+ 	head = &b->head;
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1457,7 +1423,7 @@ static long htab_map_delete_elem(struct bpf_map *map, void *key)
+ 	else
+ 		ret = -ENOENT;
+ 
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ 
+ 	if (l)
+ 		free_htab_elem(htab, l);
+@@ -1483,7 +1449,7 @@ static long htab_lru_map_delete_elem(struct bpf_map *map, void *key)
+ 	b = __select_bucket(htab, hash);
+ 	head = &b->head;
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &flags);
++	ret = htab_lock_bucket(b, &flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1494,7 +1460,7 @@ static long htab_lru_map_delete_elem(struct bpf_map *map, void *key)
+ 	else
+ 		ret = -ENOENT;
+ 
+-	htab_unlock_bucket(htab, b, hash, flags);
++	htab_unlock_bucket(b, flags);
+ 	if (l)
+ 		htab_lru_push_free(htab, l);
+ 	return ret;
+@@ -1561,7 +1527,6 @@ static void htab_map_free_timers_and_wq(struct bpf_map *map)
+ static void htab_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+-	int i;
+ 
+ 	/* bpf_free_used_maps() or close(map_fd) will trigger this map_free callback.
+ 	 * bpf_free_used_maps() is called after bpf prog is no longer executing.
+@@ -1586,9 +1551,6 @@ static void htab_map_free(struct bpf_map *map)
+ 	bpf_mem_alloc_destroy(&htab->ma);
+ 	if (htab->use_percpu_counter)
+ 		percpu_counter_destroy(&htab->pcount);
+-	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++)
+-		free_percpu(htab->map_locked[i]);
+-	lockdep_unregister_key(&htab->lockdep_key);
+ 	bpf_map_area_free(htab);
+ }
+ 
+@@ -1631,7 +1593,7 @@ static int __htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
+ 	b = __select_bucket(htab, hash);
+ 	head = &b->head;
+ 
+-	ret = htab_lock_bucket(htab, b, hash, &bflags);
++	ret = htab_lock_bucket(b, &bflags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1668,7 +1630,7 @@ static int __htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
+ 	hlist_nulls_del_rcu(&l->hash_node);
+ 
+ out_unlock:
+-	htab_unlock_bucket(htab, b, hash, bflags);
++	htab_unlock_bucket(b, bflags);
+ 
+ 	if (l) {
+ 		if (is_lru_map)
+@@ -1790,7 +1752,7 @@ __htab_map_lookup_and_delete_batch(struct bpf_map *map,
+ 	head = &b->head;
+ 	/* do not grab the lock unless need it (bucket_cnt > 0). */
+ 	if (locked) {
+-		ret = htab_lock_bucket(htab, b, batch, &flags);
++		ret = htab_lock_bucket(b, &flags);
+ 		if (ret) {
+ 			rcu_read_unlock();
+ 			bpf_enable_instrumentation();
+@@ -1813,7 +1775,7 @@ __htab_map_lookup_and_delete_batch(struct bpf_map *map,
+ 		/* Note that since bucket_cnt > 0 here, it is implicit
+ 		 * that the locked was grabbed, so release it.
+ 		 */
+-		htab_unlock_bucket(htab, b, batch, flags);
++		htab_unlock_bucket(b, flags);
+ 		rcu_read_unlock();
+ 		bpf_enable_instrumentation();
+ 		goto after_loop;
+@@ -1824,7 +1786,7 @@ __htab_map_lookup_and_delete_batch(struct bpf_map *map,
+ 		/* Note that since bucket_cnt > 0 here, it is implicit
+ 		 * that the locked was grabbed, so release it.
+ 		 */
+-		htab_unlock_bucket(htab, b, batch, flags);
++		htab_unlock_bucket(b, flags);
+ 		rcu_read_unlock();
+ 		bpf_enable_instrumentation();
+ 		kvfree(keys);
+@@ -1887,7 +1849,7 @@ __htab_map_lookup_and_delete_batch(struct bpf_map *map,
+ 		dst_val += value_size;
+ 	}
+ 
+-	htab_unlock_bucket(htab, b, batch, flags);
++	htab_unlock_bucket(b, flags);
+ 	locked = false;
+ 
+ 	while (node_to_free) {
+-- 
+cgit 1.2.3-korg
+
+
+From f2ac0e5d1c4dcc55d6510dcaefb8f45661a9a1fb Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:36 -0700
+Subject: bpf: Convert percpu_freelist.c to rqspinlock
+
+Convert the percpu_freelist.c code to use rqspinlock, and remove the
+extralist fallback and trylock-based acquisitions to avoid deadlocks.
+
+Key thing to note is the retained while (true) loop to search through
+other CPUs when failing to push a node due to locking errors. This
+retains the behavior of the old code, where it would keep trying until
+it would be able to successfully push the node back into the freelist of
+a CPU.
+
+Technically, we should start iteration for this loop from
+raw_smp_processor_id() + 1, but to avoid hitting the edge of nr_cpus,
+we skip execution in the loop body instead.
+
+Closes: https://lore.kernel.org/bpf/CAPPBnEa1_pZ6W24+WwtcNFvTUHTHO7KUmzEbOcMqxp+m2o15qQ@mail.gmail.com
+Closes: https://lore.kernel.org/bpf/CAPPBnEYm+9zduStsZaDnq93q1jPLqO-PiKX9jy0MuL8LCXmCrQ@mail.gmail.com
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-21-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/percpu_freelist.c | 113 ++++++++++---------------------------------
+ kernel/bpf/percpu_freelist.h |   4 +-
+ 2 files changed, 27 insertions(+), 90 deletions(-)
+
+diff --git a/kernel/bpf/percpu_freelist.c b/kernel/bpf/percpu_freelist.c
+index 034cf87b54e9f0..632762b5729989 100644
+--- a/kernel/bpf/percpu_freelist.c
++++ b/kernel/bpf/percpu_freelist.c
+@@ -14,11 +14,9 @@ int pcpu_freelist_init(struct pcpu_freelist *s)
+ 	for_each_possible_cpu(cpu) {
+ 		struct pcpu_freelist_head *head = per_cpu_ptr(s->freelist, cpu);
+ 
+-		raw_spin_lock_init(&head->lock);
++		raw_res_spin_lock_init(&head->lock);
+ 		head->first = NULL;
+ 	}
+-	raw_spin_lock_init(&s->extralist.lock);
+-	s->extralist.first = NULL;
+ 	return 0;
+ }
+ 
+@@ -34,58 +32,39 @@ static inline void pcpu_freelist_push_node(struct pcpu_freelist_head *head,
+ 	WRITE_ONCE(head->first, node);
+ }
+ 
+-static inline void ___pcpu_freelist_push(struct pcpu_freelist_head *head,
++static inline bool ___pcpu_freelist_push(struct pcpu_freelist_head *head,
+ 					 struct pcpu_freelist_node *node)
+ {
+-	raw_spin_lock(&head->lock);
+-	pcpu_freelist_push_node(head, node);
+-	raw_spin_unlock(&head->lock);
+-}
+-
+-static inline bool pcpu_freelist_try_push_extra(struct pcpu_freelist *s,
+-						struct pcpu_freelist_node *node)
+-{
+-	if (!raw_spin_trylock(&s->extralist.lock))
++	if (raw_res_spin_lock(&head->lock))
+ 		return false;
+-
+-	pcpu_freelist_push_node(&s->extralist, node);
+-	raw_spin_unlock(&s->extralist.lock);
++	pcpu_freelist_push_node(head, node);
++	raw_res_spin_unlock(&head->lock);
+ 	return true;
+ }
+ 
+-static inline void ___pcpu_freelist_push_nmi(struct pcpu_freelist *s,
+-					     struct pcpu_freelist_node *node)
++void __pcpu_freelist_push(struct pcpu_freelist *s,
++			struct pcpu_freelist_node *node)
+ {
+-	int cpu, orig_cpu;
++	struct pcpu_freelist_head *head;
++	int cpu;
+ 
+-	orig_cpu = raw_smp_processor_id();
+-	while (1) {
+-		for_each_cpu_wrap(cpu, cpu_possible_mask, orig_cpu) {
+-			struct pcpu_freelist_head *head;
++	if (___pcpu_freelist_push(this_cpu_ptr(s->freelist), node))
++		return;
+ 
++	while (true) {
++		for_each_cpu_wrap(cpu, cpu_possible_mask, raw_smp_processor_id()) {
++			if (cpu == raw_smp_processor_id())
++				continue;
+ 			head = per_cpu_ptr(s->freelist, cpu);
+-			if (raw_spin_trylock(&head->lock)) {
+-				pcpu_freelist_push_node(head, node);
+-				raw_spin_unlock(&head->lock);
+-				return;
+-			}
+-		}
+-
+-		/* cannot lock any per cpu lock, try extralist */
+-		if (pcpu_freelist_try_push_extra(s, node))
++			if (raw_res_spin_lock(&head->lock))
++				continue;
++			pcpu_freelist_push_node(head, node);
++			raw_res_spin_unlock(&head->lock);
+ 			return;
++		}
+ 	}
+ }
+ 
+-void __pcpu_freelist_push(struct pcpu_freelist *s,
+-			struct pcpu_freelist_node *node)
+-{
+-	if (in_nmi())
+-		___pcpu_freelist_push_nmi(s, node);
+-	else
+-		___pcpu_freelist_push(this_cpu_ptr(s->freelist), node);
+-}
+-
+ void pcpu_freelist_push(struct pcpu_freelist *s,
+ 			struct pcpu_freelist_node *node)
+ {
+@@ -120,71 +99,29 @@ void pcpu_freelist_populate(struct pcpu_freelist *s, void *buf, u32 elem_size,
+ 
+ static struct pcpu_freelist_node *___pcpu_freelist_pop(struct pcpu_freelist *s)
+ {
++	struct pcpu_freelist_node *node = NULL;
+ 	struct pcpu_freelist_head *head;
+-	struct pcpu_freelist_node *node;
+ 	int cpu;
+ 
+ 	for_each_cpu_wrap(cpu, cpu_possible_mask, raw_smp_processor_id()) {
+ 		head = per_cpu_ptr(s->freelist, cpu);
+ 		if (!READ_ONCE(head->first))
+ 			continue;
+-		raw_spin_lock(&head->lock);
++		if (raw_res_spin_lock(&head->lock))
++			continue;
+ 		node = head->first;
+ 		if (node) {
+ 			WRITE_ONCE(head->first, node->next);
+-			raw_spin_unlock(&head->lock);
++			raw_res_spin_unlock(&head->lock);
+ 			return node;
+ 		}
+-		raw_spin_unlock(&head->lock);
++		raw_res_spin_unlock(&head->lock);
+ 	}
+-
+-	/* per cpu lists are all empty, try extralist */
+-	if (!READ_ONCE(s->extralist.first))
+-		return NULL;
+-	raw_spin_lock(&s->extralist.lock);
+-	node = s->extralist.first;
+-	if (node)
+-		WRITE_ONCE(s->extralist.first, node->next);
+-	raw_spin_unlock(&s->extralist.lock);
+-	return node;
+-}
+-
+-static struct pcpu_freelist_node *
+-___pcpu_freelist_pop_nmi(struct pcpu_freelist *s)
+-{
+-	struct pcpu_freelist_head *head;
+-	struct pcpu_freelist_node *node;
+-	int cpu;
+-
+-	for_each_cpu_wrap(cpu, cpu_possible_mask, raw_smp_processor_id()) {
+-		head = per_cpu_ptr(s->freelist, cpu);
+-		if (!READ_ONCE(head->first))
+-			continue;
+-		if (raw_spin_trylock(&head->lock)) {
+-			node = head->first;
+-			if (node) {
+-				WRITE_ONCE(head->first, node->next);
+-				raw_spin_unlock(&head->lock);
+-				return node;
+-			}
+-			raw_spin_unlock(&head->lock);
+-		}
+-	}
+-
+-	/* cannot pop from per cpu lists, try extralist */
+-	if (!READ_ONCE(s->extralist.first) || !raw_spin_trylock(&s->extralist.lock))
+-		return NULL;
+-	node = s->extralist.first;
+-	if (node)
+-		WRITE_ONCE(s->extralist.first, node->next);
+-	raw_spin_unlock(&s->extralist.lock);
+ 	return node;
+ }
+ 
+ struct pcpu_freelist_node *__pcpu_freelist_pop(struct pcpu_freelist *s)
+ {
+-	if (in_nmi())
+-		return ___pcpu_freelist_pop_nmi(s);
+ 	return ___pcpu_freelist_pop(s);
+ }
+ 
+diff --git a/kernel/bpf/percpu_freelist.h b/kernel/bpf/percpu_freelist.h
+index 3c76553cfe571f..914798b7496729 100644
+--- a/kernel/bpf/percpu_freelist.h
++++ b/kernel/bpf/percpu_freelist.h
+@@ -5,15 +5,15 @@
+ #define __PERCPU_FREELIST_H__
+ #include <linux/spinlock.h>
+ #include <linux/percpu.h>
++#include <asm/rqspinlock.h>
+ 
+ struct pcpu_freelist_head {
+ 	struct pcpu_freelist_node *first;
+-	raw_spinlock_t lock;
++	rqspinlock_t lock;
+ };
+ 
+ struct pcpu_freelist {
+ 	struct pcpu_freelist_head __percpu *freelist;
+-	struct pcpu_freelist_head extralist;
+ };
+ 
+ struct pcpu_freelist_node {
+-- 
+cgit 1.2.3-korg
+
+
+From 47979314c0fe245ed54306e2f91b3f819c7c0f9f Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:37 -0700
+Subject: bpf: Convert lpm_trie.c to rqspinlock
+
+Convert all LPM trie usage of raw_spinlock to rqspinlock.
+
+Note that rcu_dereference_protected in trie_delete_elem is switched over
+to plain rcu_dereference, the RCU read lock should be held from BPF
+program side or eBPF syscall path, and the trie->lock is just acquired
+before the dereference. It is not clear the reason the protected variant
+was used from the commit history, but the above reasoning makes sense so
+switch over.
+
+Closes: https://lore.kernel.org/lkml/000000000000adb08b061413919e@google.com
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-22-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ kernel/bpf/lpm_trie.c | 25 ++++++++++++++-----------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/bpf/lpm_trie.c b/kernel/bpf/lpm_trie.c
+index e8a772e6432425..be66d7e520e0d3 100644
+--- a/kernel/bpf/lpm_trie.c
++++ b/kernel/bpf/lpm_trie.c
+@@ -15,6 +15,7 @@
+ #include <net/ipv6.h>
+ #include <uapi/linux/btf.h>
+ #include <linux/btf_ids.h>
++#include <asm/rqspinlock.h>
+ #include <linux/bpf_mem_alloc.h>
+ 
+ /* Intermediate node */
+@@ -36,7 +37,7 @@ struct lpm_trie {
+ 	size_t				n_entries;
+ 	size_t				max_prefixlen;
+ 	size_t				data_size;
+-	raw_spinlock_t			lock;
++	rqspinlock_t			lock;
+ };
+ 
+ /* This trie implements a longest prefix match algorithm that can be used to
+@@ -342,7 +343,9 @@ static long trie_update_elem(struct bpf_map *map,
+ 	if (!new_node)
+ 		return -ENOMEM;
+ 
+-	raw_spin_lock_irqsave(&trie->lock, irq_flags);
++	ret = raw_res_spin_lock_irqsave(&trie->lock, irq_flags);
++	if (ret)
++		goto out_free;
+ 
+ 	new_node->prefixlen = key->prefixlen;
+ 	RCU_INIT_POINTER(new_node->child[0], NULL);
+@@ -356,8 +359,7 @@ static long trie_update_elem(struct bpf_map *map,
+ 	 */
+ 	slot = &trie->root;
+ 
+-	while ((node = rcu_dereference_protected(*slot,
+-					lockdep_is_held(&trie->lock)))) {
++	while ((node = rcu_dereference(*slot))) {
+ 		matchlen = longest_prefix_match(trie, node, key);
+ 
+ 		if (node->prefixlen != matchlen ||
+@@ -442,8 +444,8 @@ static long trie_update_elem(struct bpf_map *map,
+ 	rcu_assign_pointer(*slot, im_node);
+ 
+ out:
+-	raw_spin_unlock_irqrestore(&trie->lock, irq_flags);
+-
++	raw_res_spin_unlock_irqrestore(&trie->lock, irq_flags);
++out_free:
+ 	if (ret)
+ 		bpf_mem_cache_free(&trie->ma, new_node);
+ 	bpf_mem_cache_free_rcu(&trie->ma, free_node);
+@@ -467,7 +469,9 @@ static long trie_delete_elem(struct bpf_map *map, void *_key)
+ 	if (key->prefixlen > trie->max_prefixlen)
+ 		return -EINVAL;
+ 
+-	raw_spin_lock_irqsave(&trie->lock, irq_flags);
++	ret = raw_res_spin_lock_irqsave(&trie->lock, irq_flags);
++	if (ret)
++		return ret;
+ 
+ 	/* Walk the tree looking for an exact key/length match and keeping
+ 	 * track of the path we traverse.  We will need to know the node
+@@ -478,8 +482,7 @@ static long trie_delete_elem(struct bpf_map *map, void *_key)
+ 	trim = &trie->root;
+ 	trim2 = trim;
+ 	parent = NULL;
+-	while ((node = rcu_dereference_protected(
+-		       *trim, lockdep_is_held(&trie->lock)))) {
++	while ((node = rcu_dereference(*trim))) {
+ 		matchlen = longest_prefix_match(trie, node, key);
+ 
+ 		if (node->prefixlen != matchlen ||
+@@ -543,7 +546,7 @@ static long trie_delete_elem(struct bpf_map *map, void *_key)
+ 	free_node = node;
+ 
+ out:
+-	raw_spin_unlock_irqrestore(&trie->lock, irq_flags);
++	raw_res_spin_unlock_irqrestore(&trie->lock, irq_flags);
+ 
+ 	bpf_mem_cache_free_rcu(&trie->ma, free_parent);
+ 	bpf_mem_cache_free_rcu(&trie->ma, free_node);
+@@ -592,7 +595,7 @@ static struct bpf_map *trie_alloc(union bpf_attr *attr)
+ 			  offsetof(struct bpf_lpm_trie_key_u8, data);
+ 	trie->max_prefixlen = trie->data_size * 8;
+ 
+-	raw_spin_lock_init(&trie->lock);
++	raw_res_spin_lock_init(&trie->lock);
+ 
+ 	/* Allocate intermediate and leaf nodes from the same allocator */
+ 	leaf_size = sizeof(struct lpm_trie_node) + trie->data_size +
+-- 
+cgit 1.2.3-korg
+
+
+From 97eb35f3ad42de1c932ef1f7e2f0044d4fca35f4 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:38 -0700
+Subject: bpf: Introduce rqspinlock kfuncs
+
+Introduce four new kfuncs, bpf_res_spin_lock, and bpf_res_spin_unlock,
+and their irqsave/irqrestore variants, which wrap the rqspinlock APIs.
+bpf_res_spin_lock returns a conditional result, depending on whether the
+lock was acquired (NULL is returned when lock acquisition succeeds,
+non-NULL upon failure). The memory pointed to by the returned pointer
+upon failure can be dereferenced after the NULL check to obtain the
+error code.
+
+Instead of using the old bpf_spin_lock type, introduce a new type with
+the same layout, and the same alignment, but a different name to avoid
+type confusion.
+
+Preemption is disabled upon successful lock acquisition, however IRQs
+are not. Special kfuncs can be introduced later to allow disabling IRQs
+when taking a spin lock. Resilient locks are safe against AA deadlocks,
+hence not disabling IRQs currently does not allow violation of kernel
+safety.
+
+__irq_flag annotation is used to accept IRQ flags for the IRQ-variants,
+with the same semantics as existing bpf_local_irq_{save, restore}.
+
+These kfuncs will require additional verifier-side support in subsequent
+commits, to allow programs to hold multiple locks at the same time.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-23-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/asm-generic/rqspinlock.h |  7 ++++
+ include/linux/bpf.h              |  1 +
+ kernel/bpf/rqspinlock.c          | 74 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 82 insertions(+)
+
+diff --git a/include/asm-generic/rqspinlock.h b/include/asm-generic/rqspinlock.h
+index 23abd0b8d0f9f5..6d4244d643df32 100644
+--- a/include/asm-generic/rqspinlock.h
++++ b/include/asm-generic/rqspinlock.h
+@@ -23,6 +23,13 @@ struct rqspinlock {
+ 	};
+ };
+ 
++/* Even though this is same as struct rqspinlock, we need to emit a distinct
++ * type in BTF for BPF programs.
++ */
++struct bpf_res_spin_lock {
++	u32 val;
++};
++
+ struct qspinlock;
+ #ifdef CONFIG_QUEUED_SPINLOCKS
+ typedef struct qspinlock rqspinlock_t;
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 973a88d9b52bc9..e3928fb19c2c9a 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -30,6 +30,7 @@
+ #include <linux/static_call.h>
+ #include <linux/memcontrol.h>
+ #include <linux/cfi.h>
++#include <asm/rqspinlock.h>
+ 
+ struct bpf_verifier_env;
+ struct bpf_verifier_log;
+diff --git a/kernel/bpf/rqspinlock.c b/kernel/bpf/rqspinlock.c
+index ed21ee0100633e..b896c4a75a5c9b 100644
+--- a/kernel/bpf/rqspinlock.c
++++ b/kernel/bpf/rqspinlock.c
+@@ -15,6 +15,8 @@
+ 
+ #include <linux/smp.h>
+ #include <linux/bug.h>
++#include <linux/bpf.h>
++#include <linux/err.h>
+ #include <linux/cpumask.h>
+ #include <linux/percpu.h>
+ #include <linux/hardirq.h>
+@@ -661,3 +663,75 @@ int __lockfunc resilient_queued_spin_lock_slowpath(rqspinlock_t *lock, u32 val)
+ EXPORT_SYMBOL_GPL(resilient_queued_spin_lock_slowpath);
+ 
+ #endif /* CONFIG_QUEUED_SPINLOCKS */
++
++__bpf_kfunc_start_defs();
++
++__bpf_kfunc int bpf_res_spin_lock(struct bpf_res_spin_lock *lock)
++{
++	int ret;
++
++	BUILD_BUG_ON(sizeof(rqspinlock_t) != sizeof(struct bpf_res_spin_lock));
++	BUILD_BUG_ON(__alignof__(rqspinlock_t) != __alignof__(struct bpf_res_spin_lock));
++
++	preempt_disable();
++	ret = res_spin_lock((rqspinlock_t *)lock);
++	if (unlikely(ret)) {
++		preempt_enable();
++		return ret;
++	}
++	return 0;
++}
++
++__bpf_kfunc void bpf_res_spin_unlock(struct bpf_res_spin_lock *lock)
++{
++	res_spin_unlock((rqspinlock_t *)lock);
++	preempt_enable();
++}
++
++__bpf_kfunc int bpf_res_spin_lock_irqsave(struct bpf_res_spin_lock *lock, unsigned long *flags__irq_flag)
++{
++	u64 *ptr = (u64 *)flags__irq_flag;
++	unsigned long flags;
++	int ret;
++
++	preempt_disable();
++	local_irq_save(flags);
++	ret = res_spin_lock((rqspinlock_t *)lock);
++	if (unlikely(ret)) {
++		local_irq_restore(flags);
++		preempt_enable();
++		return ret;
++	}
++	*ptr = flags;
++	return 0;
++}
++
++__bpf_kfunc void bpf_res_spin_unlock_irqrestore(struct bpf_res_spin_lock *lock, unsigned long *flags__irq_flag)
++{
++	u64 *ptr = (u64 *)flags__irq_flag;
++	unsigned long flags = *ptr;
++
++	res_spin_unlock((rqspinlock_t *)lock);
++	local_irq_restore(flags);
++	preempt_enable();
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(rqspinlock_kfunc_ids)
++BTF_ID_FLAGS(func, bpf_res_spin_lock, KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_res_spin_unlock)
++BTF_ID_FLAGS(func, bpf_res_spin_lock_irqsave, KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_res_spin_unlock_irqrestore)
++BTF_KFUNCS_END(rqspinlock_kfunc_ids)
++
++static const struct btf_kfunc_id_set rqspinlock_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set = &rqspinlock_kfunc_ids,
++};
++
++static __init int rqspinlock_register_kfuncs(void)
++{
++	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &rqspinlock_kfunc_set);
++}
++late_initcall(rqspinlock_register_kfuncs);
+-- 
+cgit 1.2.3-korg
+
+
+From 0de2046137f976e7302d43ac01d9894d07ac1fff Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:39 -0700
+Subject: bpf: Implement verifier support for rqspinlock
+
+Introduce verifier-side support for rqspinlock kfuncs. The first step is
+allowing bpf_res_spin_lock type to be defined in map values and
+allocated objects, so BTF-side is updated with a new BPF_RES_SPIN_LOCK
+field to recognize and validate.
+
+Any object cannot have both bpf_spin_lock and bpf_res_spin_lock, only
+one of them (and at most one of them per-object, like before) must be
+present. The bpf_res_spin_lock can also be used to protect objects that
+require lock protection for their kfuncs, like BPF rbtree and linked
+list.
+
+The verifier plumbing to simulate success and failure cases when calling
+the kfuncs is done by pushing a new verifier state to the verifier state
+stack which will verify the failure case upon calling the kfunc. The
+path where success is indicated creates all lock reference state and IRQ
+state (if necessary for irqsave variants). In the case of failure, the
+state clears the registers r0-r5, sets the return value, and skips kfunc
+processing, proceeding to the next instruction.
+
+When marking the return value for success case, the value is marked as
+0, and for the failure case as [-MAX_ERRNO, -1]. Then, in the program,
+whenever user checks the return value as 'if (ret)' or 'if (ret < 0)'
+the verifier never traverses such branches for success cases, and would
+be aware that the lock is not held in such cases.
+
+We push the kfunc state in check_kfunc_call whenever rqspinlock kfuncs
+are invoked. We introduce a kfunc_class state to avoid mixing lock
+irqrestore kfuncs with IRQ state created by bpf_local_irq_save.
+
+With all this infrastructure, these kfuncs become usable in programs
+while satisfying all safety properties required by the kernel.
+
+Acked-by: Eduard Zingerman <eddyz87@gmail.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-24-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/linux/bpf.h          |   9 ++
+ include/linux/bpf_verifier.h |  16 +++-
+ kernel/bpf/btf.c             |  26 ++++-
+ kernel/bpf/syscall.c         |   6 +-
+ kernel/bpf/verifier.c        | 219 +++++++++++++++++++++++++++++++++++--------
+ 5 files changed, 231 insertions(+), 45 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index e3928fb19c2c9a..7a87ecfa2c3f65 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -205,6 +205,7 @@ enum btf_field_type {
+ 	BPF_REFCOUNT   = (1 << 9),
+ 	BPF_WORKQUEUE  = (1 << 10),
+ 	BPF_UPTR       = (1 << 11),
++	BPF_RES_SPIN_LOCK = (1 << 12),
+ };
+ 
+ typedef void (*btf_dtor_kfunc_t)(void *);
+@@ -240,6 +241,7 @@ struct btf_record {
+ 	u32 cnt;
+ 	u32 field_mask;
+ 	int spin_lock_off;
++	int res_spin_lock_off;
+ 	int timer_off;
+ 	int wq_off;
+ 	int refcount_off;
+@@ -315,6 +317,8 @@ static inline const char *btf_field_type_name(enum btf_field_type type)
+ 	switch (type) {
+ 	case BPF_SPIN_LOCK:
+ 		return "bpf_spin_lock";
++	case BPF_RES_SPIN_LOCK:
++		return "bpf_res_spin_lock";
+ 	case BPF_TIMER:
+ 		return "bpf_timer";
+ 	case BPF_WORKQUEUE:
+@@ -347,6 +351,8 @@ static inline u32 btf_field_type_size(enum btf_field_type type)
+ 	switch (type) {
+ 	case BPF_SPIN_LOCK:
+ 		return sizeof(struct bpf_spin_lock);
++	case BPF_RES_SPIN_LOCK:
++		return sizeof(struct bpf_res_spin_lock);
+ 	case BPF_TIMER:
+ 		return sizeof(struct bpf_timer);
+ 	case BPF_WORKQUEUE:
+@@ -377,6 +383,8 @@ static inline u32 btf_field_type_align(enum btf_field_type type)
+ 	switch (type) {
+ 	case BPF_SPIN_LOCK:
+ 		return __alignof__(struct bpf_spin_lock);
++	case BPF_RES_SPIN_LOCK:
++		return __alignof__(struct bpf_res_spin_lock);
+ 	case BPF_TIMER:
+ 		return __alignof__(struct bpf_timer);
+ 	case BPF_WORKQUEUE:
+@@ -420,6 +428,7 @@ static inline void bpf_obj_init_field(const struct btf_field *field, void *addr)
+ 	case BPF_RB_ROOT:
+ 		/* RB_ROOT_CACHED 0-inits, no need to do anything after memset */
+ 	case BPF_SPIN_LOCK:
++	case BPF_RES_SPIN_LOCK:
+ 	case BPF_TIMER:
+ 	case BPF_WORKQUEUE:
+ 	case BPF_KPTR_UNREF:
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index d6cfc4ee6820c9..bc073a48aed9b4 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -115,6 +115,14 @@ struct bpf_reg_state {
+ 			int depth:30;
+ 		} iter;
+ 
++		/* For irq stack slots */
++		struct {
++			enum {
++				IRQ_NATIVE_KFUNC,
++				IRQ_LOCK_KFUNC,
++			} kfunc_class;
++		} irq;
++
+ 		/* Max size from any of the above. */
+ 		struct {
+ 			unsigned long raw1;
+@@ -255,9 +263,11 @@ struct bpf_reference_state {
+ 	 * default to pointer reference on zero initialization of a state.
+ 	 */
+ 	enum ref_state_type {
+-		REF_TYPE_PTR	= 1,
+-		REF_TYPE_IRQ	= 2,
+-		REF_TYPE_LOCK	= 3,
++		REF_TYPE_PTR		= (1 << 1),
++		REF_TYPE_IRQ		= (1 << 2),
++		REF_TYPE_LOCK		= (1 << 3),
++		REF_TYPE_RES_LOCK 	= (1 << 4),
++		REF_TYPE_RES_LOCK_IRQ	= (1 << 5),
+ 	} type;
+ 	/* Track each reference created with a unique id, even if the same
+ 	 * instruction creates the reference multiple times (eg, via CALL).
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 519e3f5e9c10fe..f7a2bfb0c11a65 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -3481,6 +3481,15 @@ static int btf_get_field_type(const struct btf *btf, const struct btf_type *var_
+ 			goto end;
+ 		}
+ 	}
++	if (field_mask & BPF_RES_SPIN_LOCK) {
++		if (!strcmp(name, "bpf_res_spin_lock")) {
++			if (*seen_mask & BPF_RES_SPIN_LOCK)
++				return -E2BIG;
++			*seen_mask |= BPF_RES_SPIN_LOCK;
++			type = BPF_RES_SPIN_LOCK;
++			goto end;
++		}
++	}
+ 	if (field_mask & BPF_TIMER) {
+ 		if (!strcmp(name, "bpf_timer")) {
+ 			if (*seen_mask & BPF_TIMER)
+@@ -3659,6 +3668,7 @@ static int btf_find_field_one(const struct btf *btf,
+ 
+ 	switch (field_type) {
+ 	case BPF_SPIN_LOCK:
++	case BPF_RES_SPIN_LOCK:
+ 	case BPF_TIMER:
+ 	case BPF_WORKQUEUE:
+ 	case BPF_LIST_NODE:
+@@ -3952,6 +3962,7 @@ struct btf_record *btf_parse_fields(const struct btf *btf, const struct btf_type
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	rec->spin_lock_off = -EINVAL;
++	rec->res_spin_lock_off = -EINVAL;
+ 	rec->timer_off = -EINVAL;
+ 	rec->wq_off = -EINVAL;
+ 	rec->refcount_off = -EINVAL;
+@@ -3979,6 +3990,11 @@ struct btf_record *btf_parse_fields(const struct btf *btf, const struct btf_type
+ 			/* Cache offset for faster lookup at runtime */
+ 			rec->spin_lock_off = rec->fields[i].offset;
+ 			break;
++		case BPF_RES_SPIN_LOCK:
++			WARN_ON_ONCE(rec->spin_lock_off >= 0);
++			/* Cache offset for faster lookup at runtime */
++			rec->res_spin_lock_off = rec->fields[i].offset;
++			break;
+ 		case BPF_TIMER:
+ 			WARN_ON_ONCE(rec->timer_off >= 0);
+ 			/* Cache offset for faster lookup at runtime */
+@@ -4022,9 +4038,15 @@ struct btf_record *btf_parse_fields(const struct btf *btf, const struct btf_type
+ 		rec->cnt++;
+ 	}
+ 
++	if (rec->spin_lock_off >= 0 && rec->res_spin_lock_off >= 0) {
++		ret = -EINVAL;
++		goto end;
++	}
++
+ 	/* bpf_{list_head, rb_node} require bpf_spin_lock */
+ 	if ((btf_record_has_field(rec, BPF_LIST_HEAD) ||
+-	     btf_record_has_field(rec, BPF_RB_ROOT)) && rec->spin_lock_off < 0) {
++	     btf_record_has_field(rec, BPF_RB_ROOT)) &&
++		 (rec->spin_lock_off < 0 && rec->res_spin_lock_off < 0)) {
+ 		ret = -EINVAL;
+ 		goto end;
+ 	}
+@@ -5637,7 +5659,7 @@ btf_parse_struct_metas(struct bpf_verifier_log *log, struct btf *btf)
+ 
+ 		type = &tab->types[tab->cnt];
+ 		type->btf_id = i;
+-		record = btf_parse_fields(btf, t, BPF_SPIN_LOCK | BPF_LIST_HEAD | BPF_LIST_NODE |
++		record = btf_parse_fields(btf, t, BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK | BPF_LIST_HEAD | BPF_LIST_NODE |
+ 						  BPF_RB_ROOT | BPF_RB_NODE | BPF_REFCOUNT |
+ 						  BPF_KPTR, t->size);
+ 		/* The record cannot be unset, treat it as an error if so */
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 380b445a304c97..77062799143e4d 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -648,6 +648,7 @@ void btf_record_free(struct btf_record *rec)
+ 		case BPF_RB_ROOT:
+ 		case BPF_RB_NODE:
+ 		case BPF_SPIN_LOCK:
++		case BPF_RES_SPIN_LOCK:
+ 		case BPF_TIMER:
+ 		case BPF_REFCOUNT:
+ 		case BPF_WORKQUEUE:
+@@ -700,6 +701,7 @@ struct btf_record *btf_record_dup(const struct btf_record *rec)
+ 		case BPF_RB_ROOT:
+ 		case BPF_RB_NODE:
+ 		case BPF_SPIN_LOCK:
++		case BPF_RES_SPIN_LOCK:
+ 		case BPF_TIMER:
+ 		case BPF_REFCOUNT:
+ 		case BPF_WORKQUEUE:
+@@ -777,6 +779,7 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
+ 
+ 		switch (fields[i].type) {
+ 		case BPF_SPIN_LOCK:
++		case BPF_RES_SPIN_LOCK:
+ 			break;
+ 		case BPF_TIMER:
+ 			bpf_timer_cancel_and_free(field_ptr);
+@@ -1212,7 +1215,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
+ 		return -EINVAL;
+ 
+ 	map->record = btf_parse_fields(btf, value_type,
+-				       BPF_SPIN_LOCK | BPF_TIMER | BPF_KPTR | BPF_LIST_HEAD |
++				       BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK | BPF_TIMER | BPF_KPTR | BPF_LIST_HEAD |
+ 				       BPF_RB_ROOT | BPF_REFCOUNT | BPF_WORKQUEUE | BPF_UPTR,
+ 				       map->value_size);
+ 	if (!IS_ERR_OR_NULL(map->record)) {
+@@ -1231,6 +1234,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
+ 			case 0:
+ 				continue;
+ 			case BPF_SPIN_LOCK:
++			case BPF_RES_SPIN_LOCK:
+ 				if (map->map_type != BPF_MAP_TYPE_HASH &&
+ 				    map->map_type != BPF_MAP_TYPE_ARRAY &&
+ 				    map->map_type != BPF_MAP_TYPE_CGROUP_STORAGE &&
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 3303a3605ee808..29121ad32a89fc 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -456,7 +456,7 @@ static bool subprog_is_exc_cb(struct bpf_verifier_env *env, int subprog)
+ 
+ static bool reg_may_point_to_spin_lock(const struct bpf_reg_state *reg)
+ {
+-	return btf_record_has_field(reg_btf_record(reg), BPF_SPIN_LOCK);
++	return btf_record_has_field(reg_btf_record(reg), BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK);
+ }
+ 
+ static bool type_is_rdonly_mem(u32 type)
+@@ -1155,7 +1155,8 @@ static int release_irq_state(struct bpf_verifier_state *state, int id);
+ 
+ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
+ 				     struct bpf_kfunc_call_arg_meta *meta,
+-				     struct bpf_reg_state *reg, int insn_idx)
++				     struct bpf_reg_state *reg, int insn_idx,
++				     int kfunc_class)
+ {
+ 	struct bpf_func_state *state = func(env, reg);
+ 	struct bpf_stack_state *slot;
+@@ -1177,6 +1178,7 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
+ 	st->type = PTR_TO_STACK; /* we don't have dedicated reg type */
+ 	st->live |= REG_LIVE_WRITTEN;
+ 	st->ref_obj_id = id;
++	st->irq.kfunc_class = kfunc_class;
+ 
+ 	for (i = 0; i < BPF_REG_SIZE; i++)
+ 		slot->slot_type[i] = STACK_IRQ_FLAG;
+@@ -1185,7 +1187,8 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
+ 	return 0;
+ }
+ 
+-static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
++static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
++				      int kfunc_class)
+ {
+ 	struct bpf_func_state *state = func(env, reg);
+ 	struct bpf_stack_state *slot;
+@@ -1199,6 +1202,15 @@ static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_r
+ 	slot = &state->stack[spi];
+ 	st = &slot->spilled_ptr;
+ 
++	if (st->irq.kfunc_class != kfunc_class) {
++		const char *flag_kfunc = st->irq.kfunc_class == IRQ_NATIVE_KFUNC ? "native" : "lock";
++		const char *used_kfunc = kfunc_class == IRQ_NATIVE_KFUNC ? "native" : "lock";
++
++		verbose(env, "irq flag acquired by %s kfuncs cannot be restored with %s kfuncs\n",
++			flag_kfunc, used_kfunc);
++		return -EINVAL;
++	}
++
+ 	err = release_irq_state(env->cur_state, st->ref_obj_id);
+ 	WARN_ON_ONCE(err && err != -EACCES);
+ 	if (err) {
+@@ -1609,7 +1621,7 @@ static struct bpf_reference_state *find_lock_state(struct bpf_verifier_state *st
+ 	for (i = 0; i < state->acquired_refs; i++) {
+ 		struct bpf_reference_state *s = &state->refs[i];
+ 
+-		if (s->type != type)
++		if (!(s->type & type))
+ 			continue;
+ 
+ 		if (s->id == id && s->ptr == ptr)
+@@ -8204,6 +8216,12 @@ static int check_kfunc_mem_size_reg(struct bpf_verifier_env *env, struct bpf_reg
+ 	return err;
+ }
+ 
++enum {
++	PROCESS_SPIN_LOCK = (1 << 0),
++	PROCESS_RES_LOCK  = (1 << 1),
++	PROCESS_LOCK_IRQ  = (1 << 2),
++};
++
+ /* Implementation details:
+  * bpf_map_lookup returns PTR_TO_MAP_VALUE_OR_NULL.
+  * bpf_obj_new returns PTR_TO_BTF_ID | MEM_ALLOC | PTR_MAYBE_NULL.
+@@ -8226,30 +8244,33 @@ static int check_kfunc_mem_size_reg(struct bpf_verifier_env *env, struct bpf_reg
+  * env->cur_state->active_locks remembers which map value element or allocated
+  * object got locked and clears it after bpf_spin_unlock.
+  */
+-static int process_spin_lock(struct bpf_verifier_env *env, int regno,
+-			     bool is_lock)
++static int process_spin_lock(struct bpf_verifier_env *env, int regno, int flags)
+ {
++	bool is_lock = flags & PROCESS_SPIN_LOCK, is_res_lock = flags & PROCESS_RES_LOCK;
++	const char *lock_str = is_res_lock ? "bpf_res_spin" : "bpf_spin";
+ 	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
+ 	struct bpf_verifier_state *cur = env->cur_state;
+ 	bool is_const = tnum_is_const(reg->var_off);
++	bool is_irq = flags & PROCESS_LOCK_IRQ;
+ 	u64 val = reg->var_off.value;
+ 	struct bpf_map *map = NULL;
+ 	struct btf *btf = NULL;
+ 	struct btf_record *rec;
++	u32 spin_lock_off;
+ 	int err;
+ 
+ 	if (!is_const) {
+ 		verbose(env,
+-			"R%d doesn't have constant offset. bpf_spin_lock has to be at the constant offset\n",
+-			regno);
++			"R%d doesn't have constant offset. %s_lock has to be at the constant offset\n",
++			regno, lock_str);
+ 		return -EINVAL;
+ 	}
+ 	if (reg->type == PTR_TO_MAP_VALUE) {
+ 		map = reg->map_ptr;
+ 		if (!map->btf) {
+ 			verbose(env,
+-				"map '%s' has to have BTF in order to use bpf_spin_lock\n",
+-				map->name);
++				"map '%s' has to have BTF in order to use %s_lock\n",
++				map->name, lock_str);
+ 			return -EINVAL;
+ 		}
+ 	} else {
+@@ -8257,36 +8278,53 @@ static int process_spin_lock(struct bpf_verifier_env *env, int regno,
+ 	}
+ 
+ 	rec = reg_btf_record(reg);
+-	if (!btf_record_has_field(rec, BPF_SPIN_LOCK)) {
+-		verbose(env, "%s '%s' has no valid bpf_spin_lock\n", map ? "map" : "local",
+-			map ? map->name : "kptr");
++	if (!btf_record_has_field(rec, is_res_lock ? BPF_RES_SPIN_LOCK : BPF_SPIN_LOCK)) {
++		verbose(env, "%s '%s' has no valid %s_lock\n", map ? "map" : "local",
++			map ? map->name : "kptr", lock_str);
+ 		return -EINVAL;
+ 	}
+-	if (rec->spin_lock_off != val + reg->off) {
+-		verbose(env, "off %lld doesn't point to 'struct bpf_spin_lock' that is at %d\n",
+-			val + reg->off, rec->spin_lock_off);
++	spin_lock_off = is_res_lock ? rec->res_spin_lock_off : rec->spin_lock_off;
++	if (spin_lock_off != val + reg->off) {
++		verbose(env, "off %lld doesn't point to 'struct %s_lock' that is at %d\n",
++			val + reg->off, lock_str, spin_lock_off);
+ 		return -EINVAL;
+ 	}
+ 	if (is_lock) {
+ 		void *ptr;
++		int type;
+ 
+ 		if (map)
+ 			ptr = map;
+ 		else
+ 			ptr = btf;
+ 
+-		if (cur->active_locks) {
+-			verbose(env,
+-				"Locking two bpf_spin_locks are not allowed\n");
+-			return -EINVAL;
++		if (!is_res_lock && cur->active_locks) {
++			if (find_lock_state(env->cur_state, REF_TYPE_LOCK, 0, NULL)) {
++				verbose(env,
++					"Locking two bpf_spin_locks are not allowed\n");
++				return -EINVAL;
++			}
++		} else if (is_res_lock && cur->active_locks) {
++			if (find_lock_state(env->cur_state, REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ, reg->id, ptr)) {
++				verbose(env, "Acquiring the same lock again, AA deadlock detected\n");
++				return -EINVAL;
++			}
+ 		}
+-		err = acquire_lock_state(env, env->insn_idx, REF_TYPE_LOCK, reg->id, ptr);
++
++		if (is_res_lock && is_irq)
++			type = REF_TYPE_RES_LOCK_IRQ;
++		else if (is_res_lock)
++			type = REF_TYPE_RES_LOCK;
++		else
++			type = REF_TYPE_LOCK;
++		err = acquire_lock_state(env, env->insn_idx, type, reg->id, ptr);
+ 		if (err < 0) {
+ 			verbose(env, "Failed to acquire lock state\n");
+ 			return err;
+ 		}
+ 	} else {
+ 		void *ptr;
++		int type;
+ 
+ 		if (map)
+ 			ptr = map;
+@@ -8294,12 +8332,18 @@ static int process_spin_lock(struct bpf_verifier_env *env, int regno,
+ 			ptr = btf;
+ 
+ 		if (!cur->active_locks) {
+-			verbose(env, "bpf_spin_unlock without taking a lock\n");
++			verbose(env, "%s_unlock without taking a lock\n", lock_str);
+ 			return -EINVAL;
+ 		}
+ 
+-		if (release_lock_state(env->cur_state, REF_TYPE_LOCK, reg->id, ptr)) {
+-			verbose(env, "bpf_spin_unlock of different lock\n");
++		if (is_res_lock && is_irq)
++			type = REF_TYPE_RES_LOCK_IRQ;
++		else if (is_res_lock)
++			type = REF_TYPE_RES_LOCK;
++		else
++			type = REF_TYPE_LOCK;
++		if (release_lock_state(cur, type, reg->id, ptr)) {
++			verbose(env, "%s_unlock of different lock\n", lock_str);
+ 			return -EINVAL;
+ 		}
+ 
+@@ -9625,11 +9669,11 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg,
+ 			return -EACCES;
+ 		}
+ 		if (meta->func_id == BPF_FUNC_spin_lock) {
+-			err = process_spin_lock(env, regno, true);
++			err = process_spin_lock(env, regno, PROCESS_SPIN_LOCK);
+ 			if (err)
+ 				return err;
+ 		} else if (meta->func_id == BPF_FUNC_spin_unlock) {
+-			err = process_spin_lock(env, regno, false);
++			err = process_spin_lock(env, regno, 0);
+ 			if (err)
+ 				return err;
+ 		} else {
+@@ -11511,7 +11555,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 		regs[BPF_REG_0].map_uid = meta.map_uid;
+ 		regs[BPF_REG_0].type = PTR_TO_MAP_VALUE | ret_flag;
+ 		if (!type_may_be_null(ret_flag) &&
+-		    btf_record_has_field(meta.map_ptr->record, BPF_SPIN_LOCK)) {
++		    btf_record_has_field(meta.map_ptr->record, BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK)) {
+ 			regs[BPF_REG_0].id = ++env->id_gen;
+ 		}
+ 		break;
+@@ -11683,10 +11727,10 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ /* mark_btf_func_reg_size() is used when the reg size is determined by
+  * the BTF func_proto's return value size and argument.
+  */
+-static void mark_btf_func_reg_size(struct bpf_verifier_env *env, u32 regno,
+-				   size_t reg_size)
++static void __mark_btf_func_reg_size(struct bpf_verifier_env *env, struct bpf_reg_state *regs,
++				     u32 regno, size_t reg_size)
+ {
+-	struct bpf_reg_state *reg = &cur_regs(env)[regno];
++	struct bpf_reg_state *reg = &regs[regno];
+ 
+ 	if (regno == BPF_REG_0) {
+ 		/* Function return value */
+@@ -11704,6 +11748,12 @@ static void mark_btf_func_reg_size(struct bpf_verifier_env *env, u32 regno,
+ 	}
+ }
+ 
++static void mark_btf_func_reg_size(struct bpf_verifier_env *env, u32 regno,
++				   size_t reg_size)
++{
++	return __mark_btf_func_reg_size(env, cur_regs(env), regno, reg_size);
++}
++
+ static bool is_kfunc_acquire(struct bpf_kfunc_call_arg_meta *meta)
+ {
+ 	return meta->kfunc_flags & KF_ACQUIRE;
+@@ -11841,6 +11891,7 @@ enum {
+ 	KF_ARG_RB_ROOT_ID,
+ 	KF_ARG_RB_NODE_ID,
+ 	KF_ARG_WORKQUEUE_ID,
++	KF_ARG_RES_SPIN_LOCK_ID,
+ };
+ 
+ BTF_ID_LIST(kf_arg_btf_ids)
+@@ -11850,6 +11901,7 @@ BTF_ID(struct, bpf_list_node)
+ BTF_ID(struct, bpf_rb_root)
+ BTF_ID(struct, bpf_rb_node)
+ BTF_ID(struct, bpf_wq)
++BTF_ID(struct, bpf_res_spin_lock)
+ 
+ static bool __is_kfunc_ptr_arg_type(const struct btf *btf,
+ 				    const struct btf_param *arg, int type)
+@@ -11898,6 +11950,11 @@ static bool is_kfunc_arg_wq(const struct btf *btf, const struct btf_param *arg)
+ 	return __is_kfunc_ptr_arg_type(btf, arg, KF_ARG_WORKQUEUE_ID);
+ }
+ 
++static bool is_kfunc_arg_res_spin_lock(const struct btf *btf, const struct btf_param *arg)
++{
++	return __is_kfunc_ptr_arg_type(btf, arg, KF_ARG_RES_SPIN_LOCK_ID);
++}
++
+ static bool is_kfunc_arg_callback(struct bpf_verifier_env *env, const struct btf *btf,
+ 				  const struct btf_param *arg)
+ {
+@@ -11969,6 +12026,7 @@ enum kfunc_ptr_arg_type {
+ 	KF_ARG_PTR_TO_MAP,
+ 	KF_ARG_PTR_TO_WORKQUEUE,
+ 	KF_ARG_PTR_TO_IRQ_FLAG,
++	KF_ARG_PTR_TO_RES_SPIN_LOCK,
+ };
+ 
+ enum special_kfunc_type {
+@@ -12007,6 +12065,10 @@ enum special_kfunc_type {
+ 	KF_bpf_iter_num_destroy,
+ 	KF_bpf_set_dentry_xattr,
+ 	KF_bpf_remove_dentry_xattr,
++	KF_bpf_res_spin_lock,
++	KF_bpf_res_spin_unlock,
++	KF_bpf_res_spin_lock_irqsave,
++	KF_bpf_res_spin_unlock_irqrestore,
+ };
+ 
+ BTF_SET_START(special_kfunc_set)
+@@ -12096,6 +12158,10 @@ BTF_ID(func, bpf_remove_dentry_xattr)
+ BTF_ID_UNUSED
+ BTF_ID_UNUSED
+ #endif
++BTF_ID(func, bpf_res_spin_lock)
++BTF_ID(func, bpf_res_spin_unlock)
++BTF_ID(func, bpf_res_spin_lock_irqsave)
++BTF_ID(func, bpf_res_spin_unlock_irqrestore)
+ 
+ static bool is_kfunc_ret_null(struct bpf_kfunc_call_arg_meta *meta)
+ {
+@@ -12189,6 +12255,9 @@ get_kfunc_ptr_arg_type(struct bpf_verifier_env *env,
+ 	if (is_kfunc_arg_irq_flag(meta->btf, &args[argno]))
+ 		return KF_ARG_PTR_TO_IRQ_FLAG;
+ 
++	if (is_kfunc_arg_res_spin_lock(meta->btf, &args[argno]))
++		return KF_ARG_PTR_TO_RES_SPIN_LOCK;
++
+ 	if ((base_type(reg->type) == PTR_TO_BTF_ID || reg2btf_ids[base_type(reg->type)])) {
+ 		if (!btf_type_is_struct(ref_t)) {
+ 			verbose(env, "kernel function %s args#%d pointer type %s %s is not supported\n",
+@@ -12296,13 +12365,19 @@ static int process_irq_flag(struct bpf_verifier_env *env, int regno,
+ 			     struct bpf_kfunc_call_arg_meta *meta)
+ {
+ 	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
++	int err, kfunc_class = IRQ_NATIVE_KFUNC;
+ 	bool irq_save;
+-	int err;
+ 
+-	if (meta->func_id == special_kfunc_list[KF_bpf_local_irq_save]) {
++	if (meta->func_id == special_kfunc_list[KF_bpf_local_irq_save] ||
++	    meta->func_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave]) {
+ 		irq_save = true;
+-	} else if (meta->func_id == special_kfunc_list[KF_bpf_local_irq_restore]) {
++		if (meta->func_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave])
++			kfunc_class = IRQ_LOCK_KFUNC;
++	} else if (meta->func_id == special_kfunc_list[KF_bpf_local_irq_restore] ||
++		   meta->func_id == special_kfunc_list[KF_bpf_res_spin_unlock_irqrestore]) {
+ 		irq_save = false;
++		if (meta->func_id == special_kfunc_list[KF_bpf_res_spin_unlock_irqrestore])
++			kfunc_class = IRQ_LOCK_KFUNC;
+ 	} else {
+ 		verbose(env, "verifier internal error: unknown irq flags kfunc\n");
+ 		return -EFAULT;
+@@ -12318,7 +12393,7 @@ static int process_irq_flag(struct bpf_verifier_env *env, int regno,
+ 		if (err)
+ 			return err;
+ 
+-		err = mark_stack_slot_irq_flag(env, meta, reg, env->insn_idx);
++		err = mark_stack_slot_irq_flag(env, meta, reg, env->insn_idx, kfunc_class);
+ 		if (err)
+ 			return err;
+ 	} else {
+@@ -12332,7 +12407,7 @@ static int process_irq_flag(struct bpf_verifier_env *env, int regno,
+ 		if (err)
+ 			return err;
+ 
+-		err = unmark_stack_slot_irq_flag(env, reg);
++		err = unmark_stack_slot_irq_flag(env, reg, kfunc_class);
+ 		if (err)
+ 			return err;
+ 	}
+@@ -12459,7 +12534,8 @@ static int check_reg_allocation_locked(struct bpf_verifier_env *env, struct bpf_
+ 
+ 	if (!env->cur_state->active_locks)
+ 		return -EINVAL;
+-	s = find_lock_state(env->cur_state, REF_TYPE_LOCK, id, ptr);
++	s = find_lock_state(env->cur_state, REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
++			    id, ptr);
+ 	if (!s) {
+ 		verbose(env, "held lock and object are not in the same allocation\n");
+ 		return -EINVAL;
+@@ -12495,9 +12571,18 @@ static bool is_bpf_graph_api_kfunc(u32 btf_id)
+ 	       btf_id == special_kfunc_list[KF_bpf_refcount_acquire_impl];
+ }
+ 
++static bool is_bpf_res_spin_lock_kfunc(u32 btf_id)
++{
++	return btf_id == special_kfunc_list[KF_bpf_res_spin_lock] ||
++	       btf_id == special_kfunc_list[KF_bpf_res_spin_unlock] ||
++	       btf_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave] ||
++	       btf_id == special_kfunc_list[KF_bpf_res_spin_unlock_irqrestore];
++}
++
+ static bool kfunc_spin_allowed(u32 btf_id)
+ {
+-	return is_bpf_graph_api_kfunc(btf_id) || is_bpf_iter_num_api_kfunc(btf_id);
++	return is_bpf_graph_api_kfunc(btf_id) || is_bpf_iter_num_api_kfunc(btf_id) ||
++	       is_bpf_res_spin_lock_kfunc(btf_id);
+ }
+ 
+ static bool is_sync_callback_calling_kfunc(u32 btf_id)
+@@ -12929,6 +13014,7 @@ static int check_kfunc_args(struct bpf_verifier_env *env, struct bpf_kfunc_call_
+ 		case KF_ARG_PTR_TO_CONST_STR:
+ 		case KF_ARG_PTR_TO_WORKQUEUE:
+ 		case KF_ARG_PTR_TO_IRQ_FLAG:
++		case KF_ARG_PTR_TO_RES_SPIN_LOCK:
+ 			break;
+ 		default:
+ 			WARN_ON_ONCE(1);
+@@ -13227,6 +13313,28 @@ static int check_kfunc_args(struct bpf_verifier_env *env, struct bpf_kfunc_call_
+ 			if (ret < 0)
+ 				return ret;
+ 			break;
++		case KF_ARG_PTR_TO_RES_SPIN_LOCK:
++		{
++			int flags = PROCESS_RES_LOCK;
++
++			if (reg->type != PTR_TO_MAP_VALUE && reg->type != (PTR_TO_BTF_ID | MEM_ALLOC)) {
++				verbose(env, "arg#%d doesn't point to map value or allocated object\n", i);
++				return -EINVAL;
++			}
++
++			if (!is_bpf_res_spin_lock_kfunc(meta->func_id))
++				return -EFAULT;
++			if (meta->func_id == special_kfunc_list[KF_bpf_res_spin_lock] ||
++			    meta->func_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave])
++				flags |= PROCESS_SPIN_LOCK;
++			if (meta->func_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave] ||
++			    meta->func_id == special_kfunc_list[KF_bpf_res_spin_unlock_irqrestore])
++				flags |= PROCESS_LOCK_IRQ;
++			ret = process_spin_lock(env, regno, flags);
++			if (ret < 0)
++				return ret;
++			break;
++		}
+ 		}
+ 	}
+ 
+@@ -13312,6 +13420,33 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 
+ 	insn_aux->is_iter_next = is_iter_next_kfunc(&meta);
+ 
++	if (!insn->off &&
++	    (insn->imm == special_kfunc_list[KF_bpf_res_spin_lock] ||
++	     insn->imm == special_kfunc_list[KF_bpf_res_spin_lock_irqsave])) {
++		struct bpf_verifier_state *branch;
++		struct bpf_reg_state *regs;
++
++		branch = push_stack(env, env->insn_idx + 1, env->insn_idx, false);
++		if (!branch) {
++			verbose(env, "failed to push state for failed lock acquisition\n");
++			return -ENOMEM;
++		}
++
++		regs = branch->frame[branch->curframe]->regs;
++
++		/* Clear r0-r5 registers in forked state */
++		for (i = 0; i < CALLER_SAVED_REGS; i++)
++			mark_reg_not_init(env, regs, caller_saved[i]);
++
++		mark_reg_unknown(env, regs, BPF_REG_0);
++		err = __mark_reg_s32_range(env, regs, BPF_REG_0, -MAX_ERRNO, -1);
++		if (err) {
++			verbose(env, "failed to mark s32 range for retval in forked state for lock\n");
++			return err;
++		}
++		__mark_btf_func_reg_size(env, regs, BPF_REG_0, sizeof(u32));
++	}
++
+ 	if (is_kfunc_destructive(&meta) && !capable(CAP_SYS_BOOT)) {
+ 		verbose(env, "destructive kfunc calls require CAP_SYS_BOOT capability\n");
+ 		return -EACCES;
+@@ -13482,6 +13617,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 
+ 	if (btf_type_is_scalar(t)) {
+ 		mark_reg_unknown(env, regs, BPF_REG_0);
++		if (meta.btf == btf_vmlinux && (meta.func_id == special_kfunc_list[KF_bpf_res_spin_lock] ||
++		    meta.func_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave]))
++			__mark_reg_const_zero(env, &regs[BPF_REG_0]);
+ 		mark_btf_func_reg_size(env, BPF_REG_0, t->size);
+ 	} else if (btf_type_is_ptr(t)) {
+ 		ptr_type = btf_type_skip_modifiers(desc_btf, t->type, &ptr_type_id);
+@@ -18417,7 +18555,8 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+ 		case STACK_IRQ_FLAG:
+ 			old_reg = &old->stack[spi].spilled_ptr;
+ 			cur_reg = &cur->stack[spi].spilled_ptr;
+-			if (!check_ids(old_reg->ref_obj_id, cur_reg->ref_obj_id, idmap))
++			if (!check_ids(old_reg->ref_obj_id, cur_reg->ref_obj_id, idmap) ||
++			    old_reg->irq.kfunc_class != cur_reg->irq.kfunc_class)
+ 				return false;
+ 			break;
+ 		case STACK_MISC:
+@@ -18461,6 +18600,8 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
+ 		case REF_TYPE_IRQ:
+ 			break;
+ 		case REF_TYPE_LOCK:
++		case REF_TYPE_RES_LOCK:
++		case REF_TYPE_RES_LOCK_IRQ:
+ 			if (old->refs[i].ptr != cur->refs[i].ptr)
+ 				return false;
+ 			break;
+@@ -19746,7 +19887,7 @@ static int check_map_prog_compatibility(struct bpf_verifier_env *env,
+ 		}
+ 	}
+ 
+-	if (btf_record_has_field(map->record, BPF_SPIN_LOCK)) {
++	if (btf_record_has_field(map->record, BPF_SPIN_LOCK | BPF_RES_SPIN_LOCK)) {
+ 		if (prog_type == BPF_PROG_TYPE_SOCKET_FILTER) {
+ 			verbose(env, "socket filter progs cannot use bpf_spin_lock yet\n");
+ 			return -EINVAL;
+-- 
+cgit 1.2.3-korg
+
+
+From ea21771c077c7aa85d46dd021d03eb0d96b5f418 Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:40 -0700
+Subject: bpf: Maintain FIFO property for rqspinlock unlock
+
+Since out-of-order unlocks are unsupported for rqspinlock, and irqsave
+variants enforce strict FIFO ordering anyway, make the same change for
+normal non-irqsave variants, such that FIFO ordering is enforced.
+
+Two new verifier state fields (active_lock_id, active_lock_ptr) are used
+to denote the top of the stack, and prev_id and prev_ptr are ascertained
+whenever popping the topmost entry through an unlock.
+
+Take special care to make these fields part of the state comparison in
+refsafe.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-25-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ include/linux/bpf_verifier.h |  3 +++
+ kernel/bpf/verifier.c        | 33 ++++++++++++++++++++++++++++-----
+ 2 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index bc073a48aed9b4..9734544b6957cf 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -268,6 +268,7 @@ struct bpf_reference_state {
+ 		REF_TYPE_LOCK		= (1 << 3),
+ 		REF_TYPE_RES_LOCK 	= (1 << 4),
+ 		REF_TYPE_RES_LOCK_IRQ	= (1 << 5),
++		REF_TYPE_LOCK_MASK	= REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
+ 	} type;
+ 	/* Track each reference created with a unique id, even if the same
+ 	 * instruction creates the reference multiple times (eg, via CALL).
+@@ -434,6 +435,8 @@ struct bpf_verifier_state {
+ 	u32 active_locks;
+ 	u32 active_preempt_locks;
+ 	u32 active_irq_id;
++	u32 active_lock_id;
++	void *active_lock_ptr;
+ 	bool active_rcu_lock;
+ 
+ 	bool speculative;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 29121ad32a89fc..4057081e996f14 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1428,6 +1428,8 @@ static int copy_reference_state(struct bpf_verifier_state *dst, const struct bpf
+ 	dst->active_preempt_locks = src->active_preempt_locks;
+ 	dst->active_rcu_lock = src->active_rcu_lock;
+ 	dst->active_irq_id = src->active_irq_id;
++	dst->active_lock_id = src->active_lock_id;
++	dst->active_lock_ptr = src->active_lock_ptr;
+ 	return 0;
+ }
+ 
+@@ -1527,6 +1529,8 @@ static int acquire_lock_state(struct bpf_verifier_env *env, int insn_idx, enum r
+ 	s->ptr = ptr;
+ 
+ 	state->active_locks++;
++	state->active_lock_id = id;
++	state->active_lock_ptr = ptr;
+ 	return 0;
+ }
+ 
+@@ -1577,16 +1581,24 @@ static bool find_reference_state(struct bpf_verifier_state *state, int ptr_id)
+ 
+ static int release_lock_state(struct bpf_verifier_state *state, int type, int id, void *ptr)
+ {
++	void *prev_ptr = NULL;
++	u32 prev_id = 0;
+ 	int i;
+ 
+ 	for (i = 0; i < state->acquired_refs; i++) {
+-		if (state->refs[i].type != type)
+-			continue;
+-		if (state->refs[i].id == id && state->refs[i].ptr == ptr) {
++		if (state->refs[i].type == type && state->refs[i].id == id &&
++		    state->refs[i].ptr == ptr) {
+ 			release_reference_state(state, i);
+ 			state->active_locks--;
++			/* Reassign active lock (id, ptr). */
++			state->active_lock_id = prev_id;
++			state->active_lock_ptr = prev_ptr;
+ 			return 0;
+ 		}
++		if (state->refs[i].type & REF_TYPE_LOCK_MASK) {
++			prev_id = state->refs[i].id;
++			prev_ptr = state->refs[i].ptr;
++		}
+ 	}
+ 	return -EINVAL;
+ }
+@@ -8342,6 +8354,14 @@ static int process_spin_lock(struct bpf_verifier_env *env, int regno, int flags)
+ 			type = REF_TYPE_RES_LOCK;
+ 		else
+ 			type = REF_TYPE_LOCK;
++		if (!find_lock_state(cur, type, reg->id, ptr)) {
++			verbose(env, "%s_unlock of different lock\n", lock_str);
++			return -EINVAL;
++		}
++		if (reg->id != cur->active_lock_id || ptr != cur->active_lock_ptr) {
++			verbose(env, "%s_unlock cannot be out of order\n", lock_str);
++			return -EINVAL;
++		}
+ 		if (release_lock_state(cur, type, reg->id, ptr)) {
+ 			verbose(env, "%s_unlock of different lock\n", lock_str);
+ 			return -EINVAL;
+@@ -12534,8 +12554,7 @@ static int check_reg_allocation_locked(struct bpf_verifier_env *env, struct bpf_
+ 
+ 	if (!env->cur_state->active_locks)
+ 		return -EINVAL;
+-	s = find_lock_state(env->cur_state, REF_TYPE_LOCK | REF_TYPE_RES_LOCK | REF_TYPE_RES_LOCK_IRQ,
+-			    id, ptr);
++	s = find_lock_state(env->cur_state, REF_TYPE_LOCK_MASK, id, ptr);
+ 	if (!s) {
+ 		verbose(env, "held lock and object are not in the same allocation\n");
+ 		return -EINVAL;
+@@ -18591,6 +18610,10 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
+ 	if (!check_ids(old->active_irq_id, cur->active_irq_id, idmap))
+ 		return false;
+ 
++	if (!check_ids(old->active_lock_id, cur->active_lock_id, idmap) ||
++	    old->active_lock_ptr != cur->active_lock_ptr)
++		return false;
++
+ 	for (i = 0; i < old->acquired_refs; i++) {
+ 		if (!check_ids(old->refs[i].id, cur->refs[i].id, idmap) ||
+ 		    old->refs[i].type != cur->refs[i].type)
+-- 
+cgit 1.2.3-korg
+
+
+From 60ba5b3ed7278a5700c8d57c3f5486b6066f745c Mon Sep 17 00:00:00 2001
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 15 Mar 2025 21:05:41 -0700
+Subject: selftests/bpf: Add tests for rqspinlock
+
+Introduce selftests that trigger AA, ABBA deadlocks, and test the edge
+case where the held locks table runs out of entries, since we then
+fallback to the timeout as the final line of defense. Also exercise
+verifier's AA detection where applicable.
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20250316040541.108729-26-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+---
+ .../selftests/bpf/prog_tests/res_spin_lock.c       |  98 +++++++++
+ tools/testing/selftests/bpf/progs/irq.c            |  53 +++++
+ tools/testing/selftests/bpf/progs/res_spin_lock.c  | 143 ++++++++++++
+ .../selftests/bpf/progs/res_spin_lock_fail.c       | 244 +++++++++++++++++++++
+ 4 files changed, 538 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/res_spin_lock.c
+ create mode 100644 tools/testing/selftests/bpf/progs/res_spin_lock.c
+ create mode 100644 tools/testing/selftests/bpf/progs/res_spin_lock_fail.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/res_spin_lock.c b/tools/testing/selftests/bpf/prog_tests/res_spin_lock.c
+new file mode 100644
+index 00000000000000..115287ba441bfd
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/res_spin_lock.c
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024-2025 Meta Platforms, Inc. and affiliates. */
++#include <test_progs.h>
++#include <network_helpers.h>
++#include <sys/sysinfo.h>
++
++#include "res_spin_lock.skel.h"
++#include "res_spin_lock_fail.skel.h"
++
++void test_res_spin_lock_failure(void)
++{
++	RUN_TESTS(res_spin_lock_fail);
++}
++
++static volatile int skip;
++
++static void *spin_lock_thread(void *arg)
++{
++	int err, prog_fd = *(u32 *) arg;
++	LIBBPF_OPTS(bpf_test_run_opts, topts,
++		.data_in = &pkt_v4,
++		.data_size_in = sizeof(pkt_v4),
++		.repeat = 10000,
++	);
++
++	while (!READ_ONCE(skip)) {
++		err = bpf_prog_test_run_opts(prog_fd, &topts);
++		ASSERT_OK(err, "test_run");
++		ASSERT_OK(topts.retval, "test_run retval");
++	}
++	pthread_exit(arg);
++}
++
++void test_res_spin_lock_success(void)
++{
++	LIBBPF_OPTS(bpf_test_run_opts, topts,
++		.data_in = &pkt_v4,
++		.data_size_in = sizeof(pkt_v4),
++		.repeat = 1,
++	);
++	struct res_spin_lock *skel;
++	pthread_t thread_id[16];
++	int prog_fd, i, err;
++	void *ret;
++
++	if (get_nprocs() < 2) {
++		test__skip();
++		return;
++	}
++
++	skel = res_spin_lock__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "res_spin_lock__open_and_load"))
++		return;
++	/* AA deadlock */
++	prog_fd = bpf_program__fd(skel->progs.res_spin_lock_test);
++	err = bpf_prog_test_run_opts(prog_fd, &topts);
++	ASSERT_OK(err, "error");
++	ASSERT_OK(topts.retval, "retval");
++
++	prog_fd = bpf_program__fd(skel->progs.res_spin_lock_test_held_lock_max);
++	err = bpf_prog_test_run_opts(prog_fd, &topts);
++	ASSERT_OK(err, "error");
++	ASSERT_OK(topts.retval, "retval");
++
++	/* Multi-threaded ABBA deadlock. */
++
++	prog_fd = bpf_program__fd(skel->progs.res_spin_lock_test_AB);
++	for (i = 0; i < 16; i++) {
++		int err;
++
++		err = pthread_create(&thread_id[i], NULL, &spin_lock_thread, &prog_fd);
++		if (!ASSERT_OK(err, "pthread_create"))
++			goto end;
++	}
++
++	topts.retval = 0;
++	topts.repeat = 1000;
++	int fd = bpf_program__fd(skel->progs.res_spin_lock_test_BA);
++	while (!topts.retval && !err && !READ_ONCE(skel->bss->err)) {
++		err = bpf_prog_test_run_opts(fd, &topts);
++	}
++
++	WRITE_ONCE(skip, true);
++
++	for (i = 0; i < 16; i++) {
++		if (!ASSERT_OK(pthread_join(thread_id[i], &ret), "pthread_join"))
++			goto end;
++		if (!ASSERT_EQ(ret, &prog_fd, "ret == prog_fd"))
++			goto end;
++	}
++
++	ASSERT_EQ(READ_ONCE(skel->bss->err), -EDEADLK, "timeout err");
++	ASSERT_OK(err, "err");
++	ASSERT_EQ(topts.retval, -EDEADLK, "timeout");
++end:
++	res_spin_lock__destroy(skel);
++	return;
++}
+diff --git a/tools/testing/selftests/bpf/progs/irq.c b/tools/testing/selftests/bpf/progs/irq.c
+index 298d48d7886d92..74d912b22de903 100644
+--- a/tools/testing/selftests/bpf/progs/irq.c
++++ b/tools/testing/selftests/bpf/progs/irq.c
+@@ -11,6 +11,9 @@ extern void bpf_local_irq_save(unsigned long *) __weak __ksym;
+ extern void bpf_local_irq_restore(unsigned long *) __weak __ksym;
+ extern int bpf_copy_from_user_str(void *dst, u32 dst__sz, const void *unsafe_ptr__ign, u64 flags) __weak __ksym;
+ 
++struct bpf_res_spin_lock lockA __hidden SEC(".data.A");
++struct bpf_res_spin_lock lockB __hidden SEC(".data.B");
++
+ SEC("?tc")
+ __failure __msg("arg#0 doesn't point to an irq flag on stack")
+ int irq_save_bad_arg(struct __sk_buff *ctx)
+@@ -510,4 +513,54 @@ int irq_sleepable_global_subprog_indirect(void *ctx)
+ 	return 0;
+ }
+ 
++SEC("?tc")
++__failure __msg("cannot restore irq state out of order")
++int irq_ooo_lock_cond_inv(struct __sk_buff *ctx)
++{
++	unsigned long flags1, flags2;
++
++	if (bpf_res_spin_lock_irqsave(&lockA, &flags1))
++		return 0;
++	if (bpf_res_spin_lock_irqsave(&lockB, &flags2)) {
++		bpf_res_spin_unlock_irqrestore(&lockA, &flags1);
++		return 0;
++	}
++
++	bpf_res_spin_unlock_irqrestore(&lockB, &flags1);
++	bpf_res_spin_unlock_irqrestore(&lockA, &flags2);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("function calls are not allowed")
++int irq_wrong_kfunc_class_1(struct __sk_buff *ctx)
++{
++	unsigned long flags1;
++
++	if (bpf_res_spin_lock_irqsave(&lockA, &flags1))
++		return 0;
++	/* For now, bpf_local_irq_restore is not allowed in critical section,
++	 * but this test ensures error will be caught with kfunc_class when it's
++	 * opened up. Tested by temporarily permitting this kfunc in critical
++	 * section.
++	 */
++	bpf_local_irq_restore(&flags1);
++	bpf_res_spin_unlock_irqrestore(&lockA, &flags1);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("function calls are not allowed")
++int irq_wrong_kfunc_class_2(struct __sk_buff *ctx)
++{
++	unsigned long flags1, flags2;
++
++	bpf_local_irq_save(&flags1);
++	if (bpf_res_spin_lock_irqsave(&lockA, &flags2))
++		return 0;
++	bpf_local_irq_restore(&flags2);
++	bpf_res_spin_unlock_irqrestore(&lockA, &flags1);
++	return 0;
++}
++
+ char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/progs/res_spin_lock.c b/tools/testing/selftests/bpf/progs/res_spin_lock.c
+new file mode 100644
+index 00000000000000..b33385dfbd3503
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/res_spin_lock.c
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024-2025 Meta Platforms, Inc. and affiliates. */
++#include <vmlinux.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_misc.h"
++
++#define EDEADLK 35
++#define ETIMEDOUT 110
++
++struct arr_elem {
++	struct bpf_res_spin_lock lock;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(max_entries, 64);
++	__type(key, int);
++	__type(value, struct arr_elem);
++} arrmap SEC(".maps");
++
++struct bpf_res_spin_lock lockA __hidden SEC(".data.A");
++struct bpf_res_spin_lock lockB __hidden SEC(".data.B");
++
++SEC("tc")
++int res_spin_lock_test(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem1, *elem2;
++	int r;
++
++	elem1 = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem1)
++		return -1;
++	elem2 = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem2)
++		return -1;
++
++	r = bpf_res_spin_lock(&elem1->lock);
++	if (r)
++		return r;
++	if (!bpf_res_spin_lock(&elem2->lock)) {
++		bpf_res_spin_unlock(&elem2->lock);
++		bpf_res_spin_unlock(&elem1->lock);
++		return -1;
++	}
++	bpf_res_spin_unlock(&elem1->lock);
++	return 0;
++}
++
++SEC("tc")
++int res_spin_lock_test_AB(struct __sk_buff *ctx)
++{
++	int r;
++
++	r = bpf_res_spin_lock(&lockA);
++	if (r)
++		return !r;
++	/* Only unlock if we took the lock. */
++	if (!bpf_res_spin_lock(&lockB))
++		bpf_res_spin_unlock(&lockB);
++	bpf_res_spin_unlock(&lockA);
++	return 0;
++}
++
++int err;
++
++SEC("tc")
++int res_spin_lock_test_BA(struct __sk_buff *ctx)
++{
++	int r;
++
++	r = bpf_res_spin_lock(&lockB);
++	if (r)
++		return !r;
++	if (!bpf_res_spin_lock(&lockA))
++		bpf_res_spin_unlock(&lockA);
++	else
++		err = -EDEADLK;
++	bpf_res_spin_unlock(&lockB);
++	return err ?: 0;
++}
++
++SEC("tc")
++int res_spin_lock_test_held_lock_max(struct __sk_buff *ctx)
++{
++	struct bpf_res_spin_lock *locks[48] = {};
++	struct arr_elem *e;
++	u64 time_beg, time;
++	int ret = 0, i;
++
++	_Static_assert(ARRAY_SIZE(((struct rqspinlock_held){}).locks) == 31,
++		       "RES_NR_HELD assumed to be 31");
++
++	for (i = 0; i < 34; i++) {
++		int key = i;
++
++		/* We cannot pass in i as it will get spilled/filled by the compiler and
++		 * loses bounds in verifier state.
++		 */
++		e = bpf_map_lookup_elem(&arrmap, &key);
++		if (!e)
++			return 1;
++		locks[i] = &e->lock;
++	}
++
++	for (; i < 48; i++) {
++		int key = i - 2;
++
++		/* We cannot pass in i as it will get spilled/filled by the compiler and
++		 * loses bounds in verifier state.
++		 */
++		e = bpf_map_lookup_elem(&arrmap, &key);
++		if (!e)
++			return 1;
++		locks[i] = &e->lock;
++	}
++
++	time_beg = bpf_ktime_get_ns();
++	for (i = 0; i < 34; i++) {
++		if (bpf_res_spin_lock(locks[i]))
++			goto end;
++	}
++
++	/* Trigger AA, after exhausting entries in the held lock table. This
++	 * time, only the timeout can save us, as AA detection won't succeed.
++	 */
++	if (!bpf_res_spin_lock(locks[34])) {
++		bpf_res_spin_unlock(locks[34]);
++		ret = 1;
++		goto end;
++	}
++
++end:
++	for (i = i - 1; i >= 0; i--)
++		bpf_res_spin_unlock(locks[i]);
++	time = bpf_ktime_get_ns() - time_beg;
++	/* Time spent should be easily above our limit (1/4 s), since AA
++	 * detection won't be expedited due to lack of held lock entry.
++	 */
++	return ret ?: (time > 1000000000 / 4 ? 0 : 1);
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/progs/res_spin_lock_fail.c b/tools/testing/selftests/bpf/progs/res_spin_lock_fail.c
+new file mode 100644
+index 00000000000000..330682a88c1611
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/res_spin_lock_fail.c
+@@ -0,0 +1,244 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024-2025 Meta Platforms, Inc. and affiliates. */
++#include <vmlinux.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_core_read.h>
++#include "bpf_misc.h"
++#include "bpf_experimental.h"
++
++struct arr_elem {
++	struct bpf_res_spin_lock lock;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(max_entries, 1);
++	__type(key, int);
++	__type(value, struct arr_elem);
++} arrmap SEC(".maps");
++
++long value;
++
++struct bpf_spin_lock lock __hidden SEC(".data.A");
++struct bpf_res_spin_lock res_lock __hidden SEC(".data.B");
++
++SEC("?tc")
++__failure __msg("point to map value or allocated object")
++int res_spin_lock_arg(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	bpf_res_spin_lock((struct bpf_res_spin_lock *)bpf_core_cast(&elem->lock, struct __sk_buff));
++	bpf_res_spin_lock(&elem->lock);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("AA deadlock detected")
++int res_spin_lock_AA(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	bpf_res_spin_lock(&elem->lock);
++	bpf_res_spin_lock(&elem->lock);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("AA deadlock detected")
++int res_spin_lock_cond_AA(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	if (bpf_res_spin_lock(&elem->lock))
++		return 0;
++	bpf_res_spin_lock(&elem->lock);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("unlock of different lock")
++int res_spin_lock_mismatch_1(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	if (bpf_res_spin_lock(&elem->lock))
++		return 0;
++	bpf_res_spin_unlock(&res_lock);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("unlock of different lock")
++int res_spin_lock_mismatch_2(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	if (bpf_res_spin_lock(&res_lock))
++		return 0;
++	bpf_res_spin_unlock(&elem->lock);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("unlock of different lock")
++int res_spin_lock_irq_mismatch_1(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++	unsigned long f1;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	bpf_local_irq_save(&f1);
++	if (bpf_res_spin_lock(&res_lock))
++		return 0;
++	bpf_res_spin_unlock_irqrestore(&res_lock, &f1);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("unlock of different lock")
++int res_spin_lock_irq_mismatch_2(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++	unsigned long f1;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	if (bpf_res_spin_lock_irqsave(&res_lock, &f1))
++		return 0;
++	bpf_res_spin_unlock(&res_lock);
++	return 0;
++}
++
++SEC("?tc")
++__success
++int res_spin_lock_ooo(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	if (bpf_res_spin_lock(&res_lock))
++		return 0;
++	if (bpf_res_spin_lock(&elem->lock)) {
++		bpf_res_spin_unlock(&res_lock);
++		return 0;
++	}
++	bpf_res_spin_unlock(&elem->lock);
++	bpf_res_spin_unlock(&res_lock);
++	return 0;
++}
++
++SEC("?tc")
++__success
++int res_spin_lock_ooo_irq(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++	unsigned long f1, f2;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	if (bpf_res_spin_lock_irqsave(&res_lock, &f1))
++		return 0;
++	if (bpf_res_spin_lock_irqsave(&elem->lock, &f2)) {
++		bpf_res_spin_unlock_irqrestore(&res_lock, &f1);
++		/* We won't have a unreleased IRQ flag error here. */
++		return 0;
++	}
++	bpf_res_spin_unlock_irqrestore(&elem->lock, &f2);
++	bpf_res_spin_unlock_irqrestore(&res_lock, &f1);
++	return 0;
++}
++
++struct bpf_res_spin_lock lock1 __hidden SEC(".data.OO1");
++struct bpf_res_spin_lock lock2 __hidden SEC(".data.OO2");
++
++SEC("?tc")
++__failure __msg("bpf_res_spin_unlock cannot be out of order")
++int res_spin_lock_ooo_unlock(struct __sk_buff *ctx)
++{
++	if (bpf_res_spin_lock(&lock1))
++		return 0;
++	if (bpf_res_spin_lock(&lock2)) {
++		bpf_res_spin_unlock(&lock1);
++		return 0;
++	}
++	bpf_res_spin_unlock(&lock1);
++	bpf_res_spin_unlock(&lock2);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("off 1 doesn't point to 'struct bpf_res_spin_lock' that is at 0")
++int res_spin_lock_bad_off(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem)
++		return 0;
++	bpf_res_spin_lock((void *)&elem->lock + 1);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("R1 doesn't have constant offset. bpf_res_spin_lock has to be at the constant offset")
++int res_spin_lock_var_off(struct __sk_buff *ctx)
++{
++	struct arr_elem *elem;
++	u64 val = value;
++
++	elem = bpf_map_lookup_elem(&arrmap, &(int){0});
++	if (!elem) {
++		// FIXME: Only inline assembly use in assert macro doesn't emit
++		//	  BTF definition.
++		bpf_throw(0);
++		return 0;
++	}
++	bpf_assert_range(val, 0, 40);
++	bpf_res_spin_lock((void *)&value + val);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("map 'res_spin.bss' has no valid bpf_res_spin_lock")
++int res_spin_lock_no_lock_map(struct __sk_buff *ctx)
++{
++	bpf_res_spin_lock((void *)&value + 1);
++	return 0;
++}
++
++SEC("?tc")
++__failure __msg("local 'kptr' has no valid bpf_res_spin_lock")
++int res_spin_lock_no_lock_kptr(struct __sk_buff *ctx)
++{
++	struct { int i; } *p = bpf_obj_new(typeof(*p));
++
++	if (!p)
++		return 0;
++	bpf_res_spin_lock((void *)p);
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
+-- 
+cgit 1.2.3-korg
+

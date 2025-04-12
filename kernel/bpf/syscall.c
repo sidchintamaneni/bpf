@@ -36,6 +36,9 @@
 #include <linux/memcontrol.h>
 #include <linux/trace_events.h>
 #include <linux/tracepoint.h>
+#include <asm-generic/irq_regs.h>
+#include <linux/sched/debug.h>
+#include <asm/unwind.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -2795,6 +2798,7 @@ static void compare_bpf_progs(struct bpf_prog *patch_prog, struct bpf_prog *prog
        pr_info("compare_bpf_progs: prog->len - %d\n", prog->len);
        pr_info("compare_bpf_progs: patch_prog->len - %d\n", patch_prog->len);
 
+       // Compare subprogs as well
        // Print prog
        pr_info("original prog:\n");
        pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
@@ -2814,6 +2818,62 @@ static void compare_bpf_progs(struct bpf_prog *patch_prog, struct bpf_prog *prog
                                patch_prog->insnsi[i].off,
                                patch_prog->insnsi[i].imm);
        }
+}
+
+static void compare_bpf_progs_after_ver(struct bpf_prog *patch_prog, struct bpf_prog *prog)
+{
+	pr_info("compare_bpf_progs_after_ver: DEBUG INFO\n");
+	pr_info("compare_bpf_progs_after_ver: prog->aux->name - %s\n", prog->aux->name);
+	pr_info("compare_bpf_progs_after_ver: prog->len - %d\n", prog->len);
+	pr_info("compare_bpf_progs_after_ver: patch_prog->len - %d\n", patch_prog->len);
+	pr_info("compare_bpf_progs_after_ver: patch_prog->subprogs count %d\n", patch_prog->aux->func_cnt);
+
+       // Compare subprogs as well
+       // Print prog
+	pr_info("original prog:\n");
+       	pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+       	for (int i = 0; i < prog->len; i++) {
+       	        pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", prog->insnsi[i].code,
+				prog->insnsi[i].dst_reg, 
+				prog->insnsi[i].src_reg,
+       	                        prog->insnsi[i].off, 
+				prog->insnsi[i].imm);
+       	}
+	pr_info("prog->subprogs count %d\n", prog->aux->func_cnt);
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		pr_info("subprog[%d] - jited_len %d\n", subprog, prog->aux->func[subprog]->jited_len);	
+		for (int i = 0; i < prog->len; i++) {
+			pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", 
+					prog->aux->func[subprog]->insnsi[i].code,
+					prog->aux->func[subprog]->insnsi[i].dst_reg, 
+					prog->aux->func[subprog]->insnsi[i].src_reg,
+       			                prog->aux->func[subprog]->insnsi[i].off, 
+					prog->aux->func[subprog]->insnsi[i].imm);
+		}
+	}
+
+       // Print patch_prog
+       pr_info("patch prog:\n");
+       pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+       for (int i = 0; i < patch_prog->len; i++) {
+               pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", patch_prog->insnsi[i].code,
+                               patch_prog->insnsi[i].dst_reg,
+                               patch_prog->insnsi[i].src_reg,
+                               patch_prog->insnsi[i].off,
+                               patch_prog->insnsi[i].imm);
+       }
+	pr_info("patch_prog->subprogs count %d\n", patch_prog->aux->func_cnt);
+	for (int subprog = 0; subprog < patch_prog->aux->func_cnt; subprog++) {
+		pr_info("subprog[%d] - jited_len %d\n", subprog, patch_prog->aux->func[subprog]->jited_len);	
+		for (int i = 0; i < prog->len; i++) {
+			pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", 
+					patch_prog->aux->func[subprog]->insnsi[i].code,
+					patch_prog->aux->func[subprog]->insnsi[i].dst_reg, 
+					patch_prog->aux->func[subprog]->insnsi[i].src_reg,
+       			                patch_prog->aux->func[subprog]->insnsi[i].off, 
+					patch_prog->aux->func[subprog]->insnsi[i].imm);
+		}
+	}
 }
 
 static int get_replacement_helper(enum bpf_return_type ret_type) {
@@ -2866,7 +2926,7 @@ static int patch_generator(struct bpf_prog *prog)
 		struct bpf_insn *insn = &prog->insnsi[insn_idx] ;
 		u8 class = BPF_CLASS(insn->code);
 		if (class == BPF_JMP || class == BPF_JMP32) { 
-			if (BPF_OP(insn->code)==BPF_CALL){
+			if (BPF_OP(insn->code) == BPF_CALL){
 				if (insn->src_reg == BPF_PSEUDO_CALL) {
 					continue;
 				}
@@ -2908,7 +2968,8 @@ static int patch_generator(struct bpf_prog *prog)
 					// DEBUG : Skipping printk for debug
 					if (func_id == BPF_FUNC_sk_release
 						|| func_id == BPF_FUNC_trace_printk 
-						|| func_id == BPF_FUNC_spin_unlock) {
+						|| func_id == BPF_FUNC_spin_unlock
+						|| func_id == BPF_FUNC_get_smp_processor_id) {
 							continue;
 					}
 					/* TODO:  check_resource_leak() points to bpf_obj_drop_impl,
@@ -3216,17 +3277,28 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
 	if (err < 0)
-		goto free_used_maps;
+		goto free_patch_prog;
 
 	if (!strncmp(prog->aux->name, "bpf_prog", sizeof("bpf_prog")-1)){
 		// DEBUG: Remove later
 		pr_info("bpf_prog_load: patch_prog compare after patching and verification\n");
-		compare_bpf_progs(patch_prog, prog);
+		compare_bpf_progs_after_ver(patch_prog, prog);
 	}
 
 	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
+
+	if (!strncmp(prog->aux->name, "bpf_prog", sizeof("bpf_prog")-1)){
+		patch_prog = bpf_prog_select_runtime(patch_prog, &err);
+		if (err < 0) {
+			pr_info("bpf_prog_load: err jiting the patch_prog %d\n", err);
+			goto free_patch_prog;
+		}
+		pr_info("bpf_prog_load: prog->jited_len %d\n", prog->jited_len);
+		pr_info("bpf_prog_load: patch_prog->jited_len %d\n", patch_prog->jited_len);
+		prog->termination_states->termination_prog = patch_prog;
+	}
 
 	err = bpf_prog_alloc_id(prog);
 	if (err)
@@ -6048,10 +6120,178 @@ static int token_create(union bpf_attr *attr)
 	return bpf_token_create(attr);
 }
 
+static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
+		struct bpf_prog *prog, unsigned long addr)
+{
+	// Dealing with two case within BPF program
+	// (1) Inside BPF program
+	// (2) Inside a subprogram
+	
+	// Case (1)
+	// if func_cnt > 0 then subprog[0] is the actual bpf program
+	// so this condition can be skipped
+	if ((prog->aux->func_cnt != 0) && 
+			(addr > (unsigned long)prog->bpf_func) && 
+			(addr < (unsigned long)prog->bpf_func + prog->jited_len)){
+		unsigned long offset = addr - (unsigned long)prog->bpf_func;
+		pr_info("find_offset_in_patch_prog: "
+				"prog->bpf_func: 0x%lx"
+				"addr: 0x%lx"
+				"offset: 0x%lx\n", (unsigned long)prog->bpf_func, addr, offset);
+		return (unsigned long)patch_prog->bpf_func + offset;
+	}
+
+	// Case (2)
+	// Can replace prog->aux with a variable -> tidyup
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		if ((addr > (unsigned long)prog->aux->func[subprog]) && (addr <
+				(unsigned long)prog->aux->func[subprog] +
+				(unsigned long)prog->aux->func[subprog]->jited_len)) {
+			
+			unsigned long offset = addr - (unsigned
+					long)prog->aux->func[subprog];
+			pr_info("find_offset_in_patch_prog: "
+					"prog->aux->func[subprog]: 0x%lx"
+					"addr: 0x%lx"
+					"offset: 0x%lx\n", (unsigned long)prog->aux->func[subprog], addr, offset);
+			return (unsigned long)patch_prog->aux->func[subprog] + offset;
+		}
+	}
+	
+	return 0;
+}
+
+void bpf_die(void *data)
+{
+	pr_info("bpf_die: Inside the raised IPI\n");
+	struct unwind_state state;
+	int cpu_id = raw_smp_processor_id();
+	struct bpf_prog *prog = (struct bpf_prog *)data;
+	struct bpf_prog *patch_prog = prog->termination_states->termination_prog;
+	struct pt_regs *regs = &prog->termination_states->pre_execution_state[cpu_id];
+	unsigned long addr, flags;
+
+	// Exit BPF die is triggered after the BPF program is executed
+	spin_lock_irqsave(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
+	if (prog->termination_states->per_cpu_state[cpu_id].cpu_id == 0) {
+		spin_unlock_irqrestore(&prog->termination_states->
+				per_cpu_state[cpu_id].lock,
+				flags);
+		pr_info("bpf_die: BPF program already terminated\n");
+		return;
+	}	
+	spin_unlock_irqrestore(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
+	
+	// DEBUG Info:
+	pr_info("bpf_die: signal for cpu id %d, prog id %d\n", cpu_id, prog->aux->id);
+	pr_info("bpf_die: regs->ip %lx\n", regs->ip);
+	// Compare jited length of prog and patch_prog
+	pr_info("bpf_die: prog->jited_len %d\n", prog->jited_len);
+	pr_info("bpf_die: patch_prog->jited_len %d\n", patch_prog->jited_len);
+
+	// termination should terminate a program not delinking it
+	// is what I think
+	
+	// Fills up the unwind_state with required reg states
+	unwind_start(&state, current, regs, NULL);
+	// Possibilites
+	// (1) Inside a BPF program
+	// (2) Inside a Helper function
+	// (3) Inside a subprog
+	// (4) There is case when subprog is called inside a helper function as callback
+	//	- in that case if the termination signal is in callback we switch back
+	//	to kernel context and then go back again to bpf program context
+	
+	// Returns the first return address stored on the stack
+	addr = unwind_get_return_address(&state);
+	// If the program is in BPF context, then it could be either case (1)/(3)
+	// Here we are concerned with only switching of RIP
+	if (is_bpf_text_address(addr)) {
+		// Check how are we handling return ip address inside a subprog
+		// FN, I think it doing the right thing
+		regs->ip = find_offset_in_patch_prog(patch_prog, prog, addr);
+	}
+
+	// This will handle if the program execution is in kernel/helper context
+	while (!is_bpf_text_address(addr)) {
+		addr = unwind_get_return_address(&state);
+	}
+	
+	// Now the address cameback to the BPF context
+	// Change the return values on the stack to patch_prog functions
+	// Now lets consider a case there is a BPF program calling a helper 
+	//	- In this case the return value will be the rip offset calc
+	//	inside the prog
+
+	while (is_bpf_text_address(addr)) {
+		// First, calculate the offset and replace the rip on the stack
+		// recursively do it till we are out of BPF program context
+		*(unsigned long *)addr = find_offset_in_patch_prog(patch_prog, prog, addr);
+		addr = unwind_get_return_address(&state);
+	}
+
+	// Case(4) needs to be carefully handled
+	
+	
+	return;
+}
+
+
+static int bpf_prog_terminate(union bpf_attr *attr)
+{
+	struct bpf_prog *prog;
+	struct termination_aux_states *term_states;
+	int cpu_id;
+	unsigned long flags;
+	pr_info("bpf_prog_terminate: starts here\n");
+	
+	prog = bpf_prog_by_id(attr->prog_id);
+	if (IS_ERR(prog)) {
+		pr_info("bpf_prog_terminate: invalid BPF program\n");
+		return PTR_ERR(prog);
+	}
+
+	term_states = prog->termination_states;
+	if (!term_states) {
+		pr_info("bpf_prog_terminate: invalid BPF termintaion states\n");
+		return -EPERM;
+	}
+
+	cpu_id = attr->prog_terminate.term_cpu_id; 
+	if (cpu_id < 0 && cpu_id >= NR_CPUS) {
+		pr_info("bpf_prog_terminate: invalid cpu id\n");
+		return -EINVAL;
+	}
+
+	spin_lock_irqsave(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
+	pr_info("bpf_prog_terminate: per_cpu_state[%d].cpu_id %d\n",
+			 cpu_id, term_states->per_cpu_state[cpu_id].cpu_id);
+	if (term_states->per_cpu_state[cpu_id].cpu_id == 0) {
+		spin_unlock_irqrestore(&prog->termination_states->
+				per_cpu_state[cpu_id].lock,
+				flags);
+		pr_info("bpf_prog_terminate: Requested BPF prog to terminate on"
+				"cpu %d is not running anymore\n", cpu_id);
+		return -EFAULT;
+	}	
+	spin_unlock_irqrestore(&prog->termination_states->per_cpu_state[cpu_id].lock,
+			flags);
+
+	smp_call_function_single(cpu_id, bpf_die, (void *)prog, 1);
+
+	pr_info("bpf_prog_terminate: ends here\n");
+	return 0;
+
+}
+
 static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 {
 	union bpf_attr attr;
 	int err;
+
 
 	err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);
 	if (err)
@@ -6183,6 +6423,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_TOKEN_CREATE:
 		err = token_create(&attr);
+		break;
+	case BPF_PROG_TERMINATE:
+		err = bpf_prog_terminate(&attr);
 		break;
 	default:
 		err = -EINVAL;
