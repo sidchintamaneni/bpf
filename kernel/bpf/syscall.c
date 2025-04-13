@@ -2876,7 +2876,16 @@ static void compare_bpf_progs_after_ver(struct bpf_prog *patch_prog, struct bpf_
 	}
 }
 
-static int get_replacement_helper(enum bpf_return_type ret_type) {
+static int get_replacement_helper(int func_id, enum bpf_return_type ret_type) {
+	
+	switch (func_id) {
+		case BPF_FUNC_loop:
+			return BPF_FUNC_loop_termination;
+		case BPF_FUNC_for_each_map_elem:
+		case BPF_FUNC_user_ringbuf_drain:
+			return -ENOTSUPP;
+	}
+
 	switch (ret_type) {
 		case RET_VOID:
 			return BPF_FUNC_dummy_void;
@@ -2903,9 +2912,6 @@ static int get_replacement_helper(enum bpf_return_type ret_type) {
 	}
 }
 
-/* TODO : Currenty it's assumed that the BPF program has only 1 block i.e. a main block and no
- * sub-prog.
- */
 static int patch_generator(struct bpf_prog *prog)
 {
 	struct call_insn_aux{
@@ -2985,7 +2991,7 @@ static int patch_generator(struct bpf_prog *prog)
 					}
 					
 					// Step d
-					new_helper_id = get_replacement_helper(fn->ret_type);
+					new_helper_id = get_replacement_helper(func_id, fn->ret_type);
 					if (new_helper_id < 0) {
 						pr_info("Return type : %d currently not having any replacements. Exiting\n", fn->ret_type);
 						return -ENOTSUPP;
@@ -3002,23 +3008,6 @@ static int patch_generator(struct bpf_prog *prog)
 					   TODO: int replacement_value; // for bpf_loop case where the iterator needs to now return !0 value to early exit the callbacks
 					   */
 					pr_info("Saved an entry to the array of call instruction\n");
-					// Step d.1 special casing 
-					if (func_id == BPF_FUNC_loop ){
-						// TODO: find the return instruction of bpf_loops' static iterator
-						pr_info("bpf_loop() currently does not have a patch generation technique at line : %d. Exiting\n", __LINE__);
-						err = -ENOTSUPP;
-						return err;
-					}
-					else if (func_id == BPF_FUNC_for_each_map_elem) {
-						pr_info("Iterator bpf_for_each_map_elem currently does not have a patch generation technique at line : %d. Exiting\n", __LINE__);
-						err = -ENOTSUPP;
-						return err;
-					}
-					else if (func_id == BPF_FUNC_user_ringbuf_drain) {
-						pr_info("Iterator bpf_user_ringbuf_drain is currently not supported in this kernel. Exiting\n");
-						err = -ENOTSUPP;
-						return err;
-					}
 				}
 			}
 		}
@@ -3253,6 +3242,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 			goto free_used_maps;
 		}
 
+		patch_prog->termination_states->is_termination_prog = true;
 		pr_info("bpf_prog_load: patch_prog clone\n");
 		err = clone_bpf_prog(patch_prog, prog);
 		if (err)
@@ -6211,12 +6201,14 @@ void bpf_die(void *data)
 	if (is_bpf_text_address(addr)) {
 		// Check how are we handling return ip address inside a subprog
 		// FN, I think it doing the right thing
+		pr_info("bpf_die: RIP is in BPF program context");
 		regs->ip = find_offset_in_patch_prog(patch_prog, prog, addr);
 	}
 
 	// This will handle if the program execution is in kernel/helper context
-	while (!is_bpf_text_address(addr)) {
+	while (!addr && !is_bpf_text_address(addr)) {
 		addr = unwind_get_return_address(&state);
+		pr_info("bpf_die: RIP is in helper context - addr 0x%lx", addr);
 	}
 	
 	// Now the address cameback to the BPF context
@@ -6225,7 +6217,7 @@ void bpf_die(void *data)
 	//	- In this case the return value will be the rip offset calc
 	//	inside the prog
 
-	while (is_bpf_text_address(addr)) {
+	while (!addr && is_bpf_text_address(addr)) {
 		// First, calculate the offset and replace the rip on the stack
 		// recursively do it till we are out of BPF program context
 		*(unsigned long *)addr = find_offset_in_patch_prog(patch_prog, prog, addr);

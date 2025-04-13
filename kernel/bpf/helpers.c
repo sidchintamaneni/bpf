@@ -226,22 +226,6 @@ BPF_CALL_0(bpf_get_current_pid_tgid)
 	if (unlikely(!task))
 		return -EINVAL;
 
-	int x = 0;
-
-	for (int i = 0; i < 10000000; i++) {
-		for (int j = 0; j < 1000000; j++) {
-			for (int k = 0; k < 1000000; k++) {
-				if ( i%2==0 && j%2==0 )
-					x++;
-				else
-					x--;
-			}	
-		}
-	}
-
-	if (x == 0)
-		task = NULL;
-
 	return (u64) task->tgid << 32 | task->pid;
 }
 
@@ -2019,6 +2003,8 @@ bpf_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_for_each_map_elem_proto;
 	case BPF_FUNC_loop:
 		return &bpf_loop_proto;
+	case BPF_FUNC_loop_termination:
+		return &bpf_loop_termination_proto;
 	case BPF_FUNC_user_ringbuf_drain:
 		return &bpf_user_ringbuf_drain_proto;
 	case BPF_FUNC_ringbuf_reserve_dynptr:

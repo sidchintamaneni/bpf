@@ -6033,6 +6033,7 @@ union bpf_attr {
 	FN(dummy_void, 212, ##ctx)			\
 	FN(dummy_int, 213, ##ctx)			\
 	FN(dummy_ptr_to_map, 214, ##ctx)		\
+	FN(loop_termination, 215, ##ctx)		\
 	/*
 	 * TODO: Remove these dummy helper interface because we
 	 * are not exposing them to userspace

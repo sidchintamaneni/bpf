@@ -1520,6 +1520,8 @@ struct btf_mod_pair {
 struct bpf_kfunc_desc_tab;
 
 struct cpu_aux {
+	// this not an id, it is a flag
+	// TODO: RENAME
 	u8 cpu_id;
 	// is spinlock a right choice here?
 	// explain reasoning to Raj
@@ -1530,6 +1532,7 @@ struct termination_aux_states {
 	struct cpu_aux *per_cpu_state;
 	struct pt_regs *pre_execution_state;
 	struct bpf_prog *termination_prog;
+	bool is_termination_prog;
 };
 
 struct bpf_prog_aux {
@@ -3401,6 +3404,7 @@ extern const struct bpf_func_proto bpf_unlocked_sk_setsockopt_proto;
 extern const struct bpf_func_proto bpf_unlocked_sk_getsockopt_proto;
 extern const struct bpf_func_proto bpf_find_vma_proto;
 extern const struct bpf_func_proto bpf_loop_proto;
+extern const struct bpf_func_proto bpf_loop_termination_proto;
 extern const struct bpf_func_proto bpf_copy_from_user_task_proto;
 extern const struct bpf_func_proto bpf_set_retval_proto;
 extern const struct bpf_func_proto bpf_get_retval_proto;
