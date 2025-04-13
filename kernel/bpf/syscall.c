@@ -6117,7 +6117,7 @@ static int is_bpf_address(struct bpf_prog *prog, unsigned long addr) {
 		return 1;
 	}
 
-	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+	for (int subprog = 1; subprog < prog->aux->func_cnt; subprog++) {
 		if ((addr > (unsigned long)prog->aux->func[subprog]->bpf_func) && (addr <
 				(unsigned long)prog->aux->func[subprog]->bpf_func +
 				(unsigned long)prog->aux->func[subprog]->jited_len)) {
@@ -6139,30 +6139,31 @@ static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
 	// Case (1)
 	// if func_cnt > 0 then subprog[0] is the actual bpf program
 	// so this condition can be skipped
-	if ((prog->aux->func_cnt != 0) && 
-			(addr > (unsigned long)prog->bpf_func) && 
+	if ((addr > (unsigned long)prog->bpf_func) && 
 			(addr < (unsigned long)prog->bpf_func + prog->jited_len)){
 		unsigned long offset = addr - (unsigned long)prog->bpf_func;
-		pr_info("find_offset_in_patch_prog: "
-				"prog->bpf_func: 0x%lx"
-				"addr: 0x%lx"
-				"offset: 0x%lx\n", (unsigned long)prog->bpf_func, addr, offset);
+		pr_info("find_offset_in_patch_prog: \n"
+				"\tprog->bpf_func: 0x%lx\n"
+				"\tpatch_prog->bpf_func: 0x%lx\n"
+				"\taddr: 0x%lx\n"
+				"\toffset: 0x%lx\n", (unsigned long)prog->bpf_func, (unsigned long)patch_prog->bpf_func,addr, offset);
 		return (unsigned long)patch_prog->bpf_func + offset;
 	}
 
 	// Case (2)
 	// Can replace prog->aux with a variable -> tidyup
-	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+	for (int subprog = 1; subprog < prog->aux->func_cnt; subprog++) {
 		if ((addr > (unsigned long)prog->aux->func[subprog]->bpf_func) && (addr <
 				(unsigned long)prog->aux->func[subprog]->bpf_func +
 				(unsigned long)prog->aux->func[subprog]->jited_len)) {
 			
 			unsigned long offset = addr - (unsigned
 					long)prog->aux->func[subprog]->bpf_func;
-			pr_info("find_offset_in_patch_prog: "
+			pr_info("find_offset_in_patch_prog: \n"
 					"\tprog->aux->func[subprog]->bpf_func: 0x%lx\n"
+					"\tpatch_prog->aux->func[subprog]->bpf_func: 0x%lx\n"
 					"\taddr: 0x%lx\n"
-					"\toffset: 0x%lx\n", (unsigned long)prog->aux->func[subprog]->bpf_func, addr, offset);
+					"\toffset: 0x%lx\n", (unsigned long)prog->aux->func[subprog]->bpf_func, (unsigned long)patch_prog->aux->func[subprog]->bpf_func, addr, offset);
 			return (unsigned long)patch_prog->aux->func[subprog]->bpf_func + offset;
 		}
 	}
@@ -6209,8 +6210,8 @@ void bpf_die(void *data)
 	unwind_start(&state, current, regs, NULL);
 	// Possibilites
 	// (1) Inside a BPF program
+		// (3) Inside a subprog
 	// (2) Inside a Helper function
-	// (3) Inside a subprog
 	// (4) There is case when subprog is called inside a helper function as callback
 	//	- in that case if the termination signal is in callback we switch back
 	//	to kernel context and then go back again to bpf program context
@@ -6228,14 +6229,14 @@ void bpf_die(void *data)
 		regs->ip = find_offset_in_patch_prog(patch_prog, prog, addr);
 	}
 
-	pr_info("bpf_die: addr && !is_bpf_address(prog, addr): %d", addr && !is_bpf_address(prog, addr));
+	//pr_info("bpf_die: addr && !is_bpf_address(prog, addr): %d", addr && !is_bpf_address(prog, addr));
 	// This will handle if the program execution is in kernel/helper context
-	while (addr && !is_bpf_address(prog, addr)) {
-		unwind_next_frame(&state);
-		addr = unwind_get_return_address(&state);
-		pr_info("bpf_die: RIP is in helper context - addr 0x%lx", addr);
-		pr_info("bpf_die: addr && !is_bpf_address(prog, addr): %d", addr && !is_bpf_address(prog, addr));
-	}
+	//while (addr && !is_bpf_address(prog, addr)) {
+	//	unwind_next_frame(&state);
+	//	addr = unwind_get_return_address(&state);
+	//	pr_info("bpf_die: RIP is in helper context - addr 0x%lx", addr);
+	//	pr_info("bpf_die: addr && !is_bpf_address(prog, addr): %d", addr && !is_bpf_address(prog, addr));
+	//}
 	
 	// Now the address cameback to the BPF context
 	// Change the return values on the stack to patch_prog functions
@@ -6243,19 +6244,24 @@ void bpf_die(void *data)
 	//	- In this case the return value will be the rip offset calc
 	//	inside the prog
 
-	while (addr && is_bpf_address(prog, addr)) {
-		// First, calculate the offset and replace the rip on the stack
-		// recursively do it till we are out of BPF program context
-		unsigned long stack_addr = (unsigned long)&state.sp;
-		pr_info("bpf_die: stack pointer state->sp 0x%lx value 0x%lx\n", &state.sp, stack_addr);
-		*(unsigned long *)stack_addr = find_offset_in_patch_prog(patch_prog, prog, addr);
+	// Case(4) needs to be carefully handled
+	// addr -> rip stored stack
+	// but we want to modify the address which is storing the rip
+	unsigned long stack_addr = regs->sp;
+	while (addr) {
+		if (is_bpf_address(prog, addr)) {
+			while(*(unsigned long *)stack_addr != addr) {
+				stack_addr += 1;
+			}
+			*(unsigned long *)stack_addr = find_offset_in_patch_prog(patch_prog, prog, addr);
+			pr_info("bpf_die: Changed stack address \n"
+					"\t stack_addr 0x%lx value 0x%lx\n", 
+					stack_addr, *(unsigned long *)stack_addr);
+		}
 		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
 	}
 
-	// Case(4) needs to be carefully handled
-	
-	
 	return;
 }
 
