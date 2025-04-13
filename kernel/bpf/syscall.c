@@ -6110,6 +6110,25 @@ static int token_create(union bpf_attr *attr)
 	return bpf_token_create(attr);
 }
 
+static int is_bpf_address(struct bpf_prog *prog, unsigned long addr) {
+
+	if ((addr > (unsigned long)prog->bpf_func) && 
+			(addr < (unsigned long)prog->bpf_func + prog->jited_len)){
+		return 1;
+	}
+
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		if ((addr > (unsigned long)prog->aux->func[subprog]->bpf_func) && (addr <
+				(unsigned long)prog->aux->func[subprog]->bpf_func +
+				(unsigned long)prog->aux->func[subprog]->jited_len)) {
+	
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
 		struct bpf_prog *prog, unsigned long addr)
 {
@@ -6134,17 +6153,17 @@ static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
 	// Case (2)
 	// Can replace prog->aux with a variable -> tidyup
 	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
-		if ((addr > (unsigned long)prog->aux->func[subprog]) && (addr <
-				(unsigned long)prog->aux->func[subprog] +
+		if ((addr > (unsigned long)prog->aux->func[subprog]->bpf_func) && (addr <
+				(unsigned long)prog->aux->func[subprog]->bpf_func +
 				(unsigned long)prog->aux->func[subprog]->jited_len)) {
 			
 			unsigned long offset = addr - (unsigned
-					long)prog->aux->func[subprog];
+					long)prog->aux->func[subprog]->bpf_func;
 			pr_info("find_offset_in_patch_prog: "
-					"prog->aux->func[subprog]: 0x%lx"
-					"addr: 0x%lx"
-					"offset: 0x%lx\n", (unsigned long)prog->aux->func[subprog], addr, offset);
-			return (unsigned long)patch_prog->aux->func[subprog] + offset;
+					"\tprog->aux->func[subprog]->bpf_func: 0x%lx\n"
+					"\taddr: 0x%lx\n"
+					"\toffset: 0x%lx\n", (unsigned long)prog->aux->func[subprog]->bpf_func, addr, offset);
+			return (unsigned long)patch_prog->aux->func[subprog]->bpf_func + offset;
 		}
 	}
 	
@@ -6162,6 +6181,8 @@ void bpf_die(void *data)
 	unsigned long addr, flags;
 
 	// Exit BPF die is triggered after the BPF program is executed
+	// TODO: There is still a chance that BPF program is executed but the 
+	// cpu_id/flag is not updated
 	spin_lock_irqsave(&prog->termination_states->per_cpu_state[cpu_id].lock,
 			flags);
 	if (prog->termination_states->per_cpu_state[cpu_id].cpu_id == 0) {
@@ -6196,19 +6217,24 @@ void bpf_die(void *data)
 	
 	// Returns the first return address stored on the stack
 	addr = unwind_get_return_address(&state);
+	pr_info("bpf_die: addr from unwind_get_return_address 0x%lx\n", addr);
+	pr_info("bpf_die: is_bpf_address(prog, addr): %d\n", is_bpf_address(prog, addr));
 	// If the program is in BPF context, then it could be either case (1)/(3)
 	// Here we are concerned with only switching of RIP
-	if (is_bpf_text_address(addr)) {
+	if (is_bpf_address(prog, addr)) {
 		// Check how are we handling return ip address inside a subprog
 		// FN, I think it doing the right thing
 		pr_info("bpf_die: RIP is in BPF program context");
 		regs->ip = find_offset_in_patch_prog(patch_prog, prog, addr);
 	}
 
+	pr_info("bpf_die: addr && !is_bpf_address(prog, addr): %d", addr && !is_bpf_address(prog, addr));
 	// This will handle if the program execution is in kernel/helper context
-	while (!addr && !is_bpf_text_address(addr)) {
+	while (addr && !is_bpf_address(prog, addr)) {
+		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
 		pr_info("bpf_die: RIP is in helper context - addr 0x%lx", addr);
+		pr_info("bpf_die: addr && !is_bpf_address(prog, addr): %d", addr && !is_bpf_address(prog, addr));
 	}
 	
 	// Now the address cameback to the BPF context
@@ -6217,10 +6243,13 @@ void bpf_die(void *data)
 	//	- In this case the return value will be the rip offset calc
 	//	inside the prog
 
-	while (!addr && is_bpf_text_address(addr)) {
+	while (addr && is_bpf_address(prog, addr)) {
 		// First, calculate the offset and replace the rip on the stack
 		// recursively do it till we are out of BPF program context
-		*(unsigned long *)addr = find_offset_in_patch_prog(patch_prog, prog, addr);
+		unsigned long stack_addr = (unsigned long)&state.sp;
+		pr_info("bpf_die: stack pointer state->sp 0x%lx value 0x%lx\n", &state.sp, stack_addr);
+		*(unsigned long *)stack_addr = find_offset_in_patch_prog(patch_prog, prog, addr);
+		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
 	}
 
