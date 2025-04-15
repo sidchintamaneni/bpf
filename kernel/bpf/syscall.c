@@ -36,6 +36,7 @@
 #include <linux/memcontrol.h>
 #include <linux/trace_events.h>
 #include <linux/tracepoint.h>
+#include <asm/unwind.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -5792,6 +5793,156 @@ static int token_create(union bpf_attr *attr)
 	return bpf_token_create(attr);
 }
 
+static bool per_cpu_flag_is_true(struct termination_aux_states *term_states)
+{
+	unsigned long flags;
+	u32 cpu_id = raw_smp_processor_id();
+
+	spin_lock_irqsave(&term_states->per_cpu_state[cpu_id].lock, 
+				flags);
+	if (term_states->per_cpu_state[cpu_id].cpu_flag == 1) {
+		spin_unlock_irqrestore(&term_states->per_cpu_state[cpu_id].lock,
+					flags);
+		return true;
+	}
+	spin_unlock_irqrestore(&term_states->per_cpu_state[cpu_id].lock,
+				flags);
+	return false;
+}
+
+static bool is_bpf_subprog_address(struct bpf_prog *prog, unsigned long addr,
+				int subprog)
+{
+	struct bpf_prog *bpf_subprog = prog->aux->func[subprog];
+	unsigned long bpf_subprog_func_addr = 
+				(unsigned long)bpf_subprog->bpf_func;
+	if ((addr > bpf_subprog_func_addr) && 
+			(addr < bpf_subprog_func_addr +
+			  (unsigned long)bpf_subprog->jited_len)) {
+		return true;
+	}
+
+	return false;
+}
+
+static bool is_bpf_address(struct bpf_prog *prog, unsigned long addr)
+{
+	if (prog->aux->func_cnt == 0) {
+		unsigned long bpf_func_addr = (unsigned long)prog->bpf_func;
+		if ((addr > bpf_func_addr) && (addr < bpf_func_addr + prog->jited_len)) {
+			return true;
+		}
+
+	} else {
+		int subprog_cnt = prog->aux->func_cnt;
+		for (int subprog = 1; subprog < subprog_cnt; subprog++) {		
+			if (is_bpf_subprog_address(prog, addr, subprog)) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
+			struct bpf_prog *prog, unsigned long addr)
+{
+	unsigned long bpf_func_addr = (unsigned long)prog->bpf_func;
+	int subprog_cnt = prog->aux->func_cnt;
+	if (subprog_cnt == 0 && is_bpf_address(prog, addr)) {
+		unsigned long offset = addr - bpf_func_addr;	
+		return (unsigned long)patch_prog->bpf_func + offset;
+	}
+
+	if (subprog_cnt != 0) {
+		for (int subprog = 1; subprog < subprog_cnt; subprog++) {		
+			if (is_bpf_subprog_address(prog, addr, subprog)) {
+				struct bpf_prog *bpf_subprog = prog->aux->func[subprog];
+				unsigned long bpf_subprog_func_addr = 
+					(unsigned long)bpf_subprog->bpf_func;
+				unsigned long offset = addr - bpf_subprog_func_addr;				
+				return bpf_subprog_func_addr + offset;
+			}
+		}
+	}
+
+	WARN_ONCE(1, "Nesting/ Pre-emption scenario");
+
+	return -EINVAL;
+}
+
+void bpf_die(void *data)
+{
+	struct unwind_state state;
+	struct bpf_prog *prog, *patch_prog;
+	struct pt_regs *regs;
+	unsigned long addr, new_addr;
+	int cpu_id = raw_smp_processor_id();
+
+	prog = (struct bpf_prog *)data;
+	patch_prog = prog->termination_states->patch_prog;
+	regs = &prog->termination_states->pre_execution_state[cpu_id];
+
+	if(!per_cpu_flag_is_true(prog->termination_states))
+		return;
+
+	unwind_start(&state, current, regs, NULL);
+
+	addr = unwind_get_return_address(&state);
+
+	if (is_bpf_address(prog, addr)) {
+		new_addr = find_offset_in_patch_prog(patch_prog, prog, addr);	
+		if (new_addr < 0)
+			return;
+		regs->ip = new_addr; 	
+	}
+
+	unsigned long stack_addr = regs->sp;
+	while (addr) {
+		if (is_bpf_address(prog, addr)) {
+			while (*(unsigned long *)stack_addr != addr) {
+				stack_addr += 1;
+			}
+			new_addr = find_offset_in_patch_prog(patch_prog, prog, addr); 
+			if (new_addr < 0)
+				return;
+			*(unsigned long *)stack_addr = new_addr;
+		}
+		unwind_next_frame(&state);
+		addr = unwind_get_return_address(&state);
+	}
+
+
+	return;
+}
+
+static int bpf_prog_terminate(union bpf_attr *attr)
+{
+	struct bpf_prog *prog;
+	struct termination_aux_states *term_states;
+	int cpu_id;
+
+	prog = bpf_prog_by_id(attr->prog_id);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	term_states = prog->termination_states;
+	if (!term_states)
+		return -ENOTSUPP;
+
+	cpu_id = attr->prog_terminate.term_cpu_id;
+	if (cpu_id < 0 && cpu_id >= NR_CPUS)
+		return -EINVAL;
+
+	if (!per_cpu_flag_is_true(term_states))
+		return -EFAULT;
+
+	smp_call_function_single(cpu_id, bpf_die, (void *)prog, 1);
+
+	return 0;
+}
+
 static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 {
 	union bpf_attr attr;
@@ -5927,6 +6078,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_TOKEN_CREATE:
 		err = token_create(&attr);
+		break;
+	case BPF_PROG_TERMINATE:
+		err = bpf_prog_terminate(&attr);
 		break;
 	default:
 		err = -EINVAL;
