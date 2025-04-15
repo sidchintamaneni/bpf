@@ -36,6 +36,8 @@
 #include <linux/memcontrol.h>
 #include <linux/trace_events.h>
 #include <linux/tracepoint.h>
+#include <asm-generic/irq_regs.h>
+#include <linux/sched/debug.h>
 #include <asm/unwind.h>
 
 #include <net/netfilter/nf_bpf_link.h>
@@ -51,6 +53,17 @@
 			IS_FD_HASH(map))
 
 #define BPF_OBJ_FLAG_MASK   (BPF_F_RDONLY | BPF_F_WRONLY)
+
+static const struct bpf_verifier_ops * const bpf_verifier_ops[] = {
+#define BPF_PROG_TYPE(_id, _name, prog_ctx_type, kern_ctx_type) \
+	[_id] = & _name ## _verifier_ops,
+#define BPF_MAP_TYPE(_id, _ops)
+#define BPF_LINK_TYPE(_id, _name)
+#include <linux/bpf_types.h>
+#undef BPF_PROG_TYPE
+#undef BPF_MAP_TYPE
+#undef BPF_LINK_TYPE
+};
 
 DEFINE_PER_CPU(int, bpf_prog_active);
 static DEFINE_IDR(prog_idr);
@@ -2757,10 +2770,262 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
+static int clone_bpf_prog(struct bpf_prog *patch_prog, struct bpf_prog *prog)
+{
+	int err = 0;
+	patch_prog->expected_attach_type = prog->expected_attach_type;
+	patch_prog->len = prog->len;
+	patch_prog->gpl_compatible = prog->gpl_compatible;
+
+	memcpy(patch_prog->insnsi, prog->insnsi,  bpf_prog_insn_size(prog));
+
+	patch_prog->orig_prog = NULL;
+	patch_prog->jited = 0;
+	patch_prog->type = prog->type; // TODO: check if type is missing
+
+	atomic64_set(&patch_prog->aux->refcnt, 1);
+
+	strncpy(patch_prog->aux->name, prog->aux->name,sizeof(prog->aux->name));
+
+	return err;
+}
+
+// DEBUG: Remove later
+static void compare_bpf_progs(struct bpf_prog *patch_prog, struct bpf_prog *prog)
+{
+       pr_info("compare_bpf_progs: DEBUG INFO\n");
+       pr_info("compare_bpf_progs: prog->aux->name - %s\n", prog->aux->name);
+       pr_info("compare_bpf_progs: prog->len - %d\n", prog->len);
+       pr_info("compare_bpf_progs: patch_prog->len - %d\n", patch_prog->len);
+
+       // Compare subprogs as well
+       // Print prog
+       pr_info("original prog:\n");
+       pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+       for (int i = 0; i < prog->len; i++) {
+               pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", prog->insnsi[i].code,
+                               prog->insnsi[i].dst_reg, prog->insnsi[i].src_reg,
+                               prog->insnsi[i].off, prog->insnsi[i].imm);
+       }
+
+       // Print patch_prog
+       pr_info("patch prog:\n");
+       pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+       for (int i = 0; i < patch_prog->len; i++) {
+               pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", patch_prog->insnsi[i].code,
+                               patch_prog->insnsi[i].dst_reg,
+                               patch_prog->insnsi[i].src_reg,
+                               patch_prog->insnsi[i].off,
+                               patch_prog->insnsi[i].imm);
+       }
+}
+
+static void compare_bpf_progs_after_ver(struct bpf_prog *patch_prog, struct bpf_prog *prog)
+{
+	pr_info("compare_bpf_progs_after_ver: DEBUG INFO\n");
+	pr_info("compare_bpf_progs_after_ver: prog->aux->name - %s\n", prog->aux->name);
+	pr_info("compare_bpf_progs_after_ver: prog->len - %d\n", prog->len);
+	pr_info("compare_bpf_progs_after_ver: patch_prog->len - %d\n", patch_prog->len);
+	pr_info("compare_bpf_progs_after_ver: patch_prog->subprogs count %d\n", patch_prog->aux->func_cnt);
+
+       // Compare subprogs as well
+       // Print prog
+	pr_info("original prog:\n");
+       	pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+       	for (int i = 0; i < prog->len; i++) {
+       	        pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", prog->insnsi[i].code,
+				prog->insnsi[i].dst_reg,
+				prog->insnsi[i].src_reg,
+       	                        prog->insnsi[i].off,
+				prog->insnsi[i].imm);
+       	}
+	pr_info("prog->subprogs count %d\n", prog->aux->func_cnt);
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		pr_info("subprog[%d] - jited_len %d\n", subprog, prog->aux->func[subprog]->jited_len);
+		for (int i = 0; i < prog->len; i++) {
+			pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n",
+					prog->aux->func[subprog]->insnsi[i].code,
+					prog->aux->func[subprog]->insnsi[i].dst_reg,
+					prog->aux->func[subprog]->insnsi[i].src_reg,
+       			                prog->aux->func[subprog]->insnsi[i].off,
+					prog->aux->func[subprog]->insnsi[i].imm);
+		}
+	}
+
+       // Print patch_prog
+       pr_info("patch prog:\n");
+       pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+       for (int i = 0; i < patch_prog->len; i++) {
+               pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", patch_prog->insnsi[i].code,
+                               patch_prog->insnsi[i].dst_reg,
+                               patch_prog->insnsi[i].src_reg,
+                               patch_prog->insnsi[i].off,
+                               patch_prog->insnsi[i].imm);
+       }
+	pr_info("patch_prog->subprogs count %d\n", patch_prog->aux->func_cnt);
+	for (int subprog = 0; subprog < patch_prog->aux->func_cnt; subprog++) {
+		pr_info("subprog[%d] - jited_len %d\n", subprog, patch_prog->aux->func[subprog]->jited_len);
+		for (int i = 0; i < prog->len; i++) {
+			pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n",
+					patch_prog->aux->func[subprog]->insnsi[i].code,
+					patch_prog->aux->func[subprog]->insnsi[i].dst_reg,
+					patch_prog->aux->func[subprog]->insnsi[i].src_reg,
+       			                patch_prog->aux->func[subprog]->insnsi[i].off,
+					patch_prog->aux->func[subprog]->insnsi[i].imm);
+		}
+	}
+}
+
+static int get_replacement_helper(int func_id, enum bpf_return_type ret_type) {
+
+	switch (func_id) {
+		case BPF_FUNC_loop:
+			return BPF_FUNC_loop_termination;
+		case BPF_FUNC_for_each_map_elem:
+		case BPF_FUNC_user_ringbuf_drain:
+			return -ENOTSUPP;
+	}
+
+	switch (ret_type) {
+		case RET_VOID:
+			return BPF_FUNC_dummy_void;
+		case RET_INTEGER:
+			return BPF_FUNC_dummy_int;
+		case RET_PTR_TO_MAP_VALUE_OR_NULL:
+			return BPF_FUNC_dummy_ptr_to_map;
+		case RET_PTR_TO_SOCKET_OR_NULL:
+		case RET_PTR_TO_TCP_SOCK_OR_NULL:
+		case RET_PTR_TO_SOCK_COMMON_OR_NULL:
+		case RET_PTR_TO_RINGBUF_MEM_OR_NULL:
+		case RET_PTR_TO_DYNPTR_MEM_OR_NULL:
+		case RET_PTR_TO_BTF_ID_OR_NULL:
+		case RET_PTR_TO_BTF_ID_TRUSTED:
+		case RET_PTR_TO_MAP_VALUE:
+		case RET_PTR_TO_SOCKET:
+		case RET_PTR_TO_TCP_SOCK:
+		case RET_PTR_TO_SOCK_COMMON:
+		case RET_PTR_TO_MEM:
+		case RET_PTR_TO_MEM_OR_BTF_ID:
+		case RET_PTR_TO_BTF_ID:
+		default:
+			return -ENOTSUPP;
+	}
+}
+
+static int patch_generator(struct bpf_prog *prog)
+{
+	struct call_insn_aux{
+		int insn_idx;
+		int replacement_helper;
+	};
+
+	struct call_insn_aux *call_indices;
+	int num_calls=0;
+	int err;
+	call_indices = vmalloc(sizeof(call_indices) * prog->len);
+
+	pr_info("Running patch_gen for prog name : %s\n", prog->aux->name);
+
+	/* Find all call insns */
+	for(int insn_idx =0 ;insn_idx < prog->len; insn_idx++)
+	{
+		struct bpf_insn *insn = &prog->insnsi[insn_idx] ;
+		u8 class = BPF_CLASS(insn->code);
+		if (class == BPF_JMP || class == BPF_JMP32) {
+			if (BPF_OP(insn->code) == BPF_CALL){
+				if (insn->src_reg == BPF_PSEUDO_CALL) {
+					continue;
+				}
+				if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL){ /*kfunc */
+					// TODO Need to use btf for getting proto
+					// If release function --> skip
+					// If acquire function --> find return type and add to list
+				}
+				else {
+					/* Steps :
+					 *	a) Identify the helper number
+					 *	b) Skip if this helper releases resources.
+					 *      c) Identify return type from the helper's proto
+					 *	d) Based on return type, assign relevant dummy helper's address
+					 *	   to the corresponding entry in call_indices.
+					 *		d.1) For bpf_loop and other iterative functions that
+					 *		     has a static function to iterate upon, we need to
+					 *		     special case : the return value of those static
+					 *		     functions needs to be pushed as one of the to-be-
+					 *		     modified instructions only in this case the return
+					 *		     value would be changed instead of a helper id
+					 *		     E.g :
+					 *			     idx #10 : bpf_loop(iter_fn)
+					 *			     idx #40 : int iter_fn(){
+					 *				.    :	    .
+					 *				.    :	    .
+					 *				.    :	    .
+					 *			     idx #50 :	return x; }
+					 *			will be seen by patch generator as 2 insns to replace:
+					 *			- insn #10 with a corresponding dummy call
+					 *			- insert insn #41 with a return 1
+					 */
+					// Step a
+					int func_id = insn->imm;
+					struct bpf_func_proto *fn = NULL;
+					int new_helper_id = -1;
+
+					// Step b
+					// DEBUG : Skipping printk for debug
+					if (func_id == BPF_FUNC_sk_release
+						|| func_id == BPF_FUNC_trace_printk
+						|| func_id == BPF_FUNC_spin_unlock
+						|| func_id == BPF_FUNC_get_smp_processor_id) {
+							continue;
+					}
+					/* TODO:  check_resource_leak() points to bpf_obj_drop_impl,
+					 * bpf_refcount_acquire etc. Need to check.
+					 */
+
+					// Step c
+					fn = bpf_verifier_ops[prog->type]->get_func_proto(func_id, prog);
+					if (!fn->func) {
+							pr_info("Failed to get helper proto. Exiting.\n");
+							err = -ENOENT;
+							return err;
+					}
+
+					// Step d
+					new_helper_id = get_replacement_helper(func_id, fn->ret_type);
+					if (new_helper_id < 0) {
+						pr_info("Return type : %d currently not having any replacements. Exiting\n", fn->ret_type);
+						return -ENOTSUPP;
+					}
+					/* Save that to the call indices list
+					 * Each index in call_indices list contains 2 information :
+					 *       - Bpf program's offset which needs to be replaced
+					 *	 - Helper call to be replaced with
+					 */
+					call_indices[num_calls].insn_idx = insn_idx;
+					call_indices[num_calls].replacement_helper= new_helper_id;
+					num_calls++;
+					/*
+					   TODO: int replacement_value; // for bpf_loop case where the iterator needs to now return !0 value to early exit the callbacks
+					   */
+					pr_info("Saved an entry to the array of call instruction\n");
+				}
+			}
+		}
+	}
+
+	/* Step 2: Patch all call insns */
+	pr_info("Generating Patch");
+	for(int k =0; k < num_calls; k++){
+		prog->insnsi[call_indices[k].insn_idx].imm = call_indices[k].replacement_helper;
+		pr_info("\tModified call at offset 0x%x to helper-id : 0x%x\n", call_indices[k].insn_idx, call_indices[k].replacement_helper);
+	}
+	return 0;
+}
+
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
 	enum bpf_prog_type type = attr->prog_type;
-	struct bpf_prog *prog, *dst_prog = NULL;
+	struct bpf_prog *prog, *patch_prog, *dst_prog = NULL;
 	struct btf *attach_btf = NULL;
 	struct bpf_token *token = NULL;
 	bool bpf_cap;
@@ -2967,15 +3232,63 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	err = security_bpf_prog_load(prog, attr, token, uattr.is_kernel);
 	if (err)
 		goto free_prog_sec;
+	
+	// Only generate patches for non-libbpf APIs (which are named as "bpf_prog*")
+	if (!strncmp(prog->aux->name, "bpf_prog", sizeof("bpf_prog")-1)){
+		pr_info("bpf_prog_load: patch_prog alloc\n");
+		patch_prog = bpf_prog_alloc_no_stats(bpf_prog_size(prog->len), 0);
+		if (!patch_prog) {
+			err = -EINVAL;
+			goto free_used_maps;
+		}
+
+		patch_prog->termination_states->is_termination_prog = true;
+		pr_info("bpf_prog_load: patch_prog clone\n");
+		err = clone_bpf_prog(patch_prog, prog);
+		if (err)
+			goto free_patch_prog;
+
+		// DEBUG: Remove later
+		pr_info("bpf_prog_load: cloned patch_prog compare\n");
+		compare_bpf_progs(patch_prog, prog);
+
+		err = patch_generator(patch_prog);
+		if (err)
+			goto free_patch_prog;
+
+		err = bpf_check(&patch_prog, attr, uattr, uattr_size);
+		if (err < 0){
+			pr_info("bpf_prog_load: patch_prog failed verification.");
+			goto free_patch_prog;
+		}
+
+	}
 
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
 	if (err < 0)
-		goto free_used_maps;
+		goto free_patch_prog;
+
+	if (!strncmp(prog->aux->name, "bpf_prog", sizeof("bpf_prog")-1)){
+		// DEBUG: Remove later
+		pr_info("bpf_prog_load: patch_prog compare after patching and verification\n");
+		compare_bpf_progs_after_ver(patch_prog, prog);
+	}
 
 	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
+
+	if (!strncmp(prog->aux->name, "bpf_prog", sizeof("bpf_prog")-1)){
+		patch_prog = bpf_prog_select_runtime(patch_prog, &err);
+		if (err < 0) {
+			pr_info("bpf_prog_load: err jiting the patch_prog %d\n", err);
+			goto free_patch_prog;
+		}
+		pr_info("bpf_prog_load: prog->jited_len %d\n", prog->jited_len);
+		pr_info("bpf_prog_load: patch_prog->jited_len %d\n", patch_prog->jited_len);
+		prog->termination_states->patch_prog = patch_prog;
+	}
 
 	err = bpf_prog_alloc_id(prog);
 	if (err)
@@ -3004,6 +3317,11 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 		bpf_prog_put(prog);
 	return err;
 
+free_patch_prog:
+       free_percpu(patch_prog->stats);
+       free_percpu(patch_prog->active);
+       kfree(patch_prog->aux);
+       vfree(patch_prog);
 free_used_maps:
 	/* In case we have subprogs, we need to wait for a grace
 	 * period before we can tear down JIT memory since symbols

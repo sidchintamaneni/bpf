@@ -6,6 +6,7 @@
 #include <linux/filter.h>
 #include <linux/bpf.h>
 #include <linux/rcupdate_trace.h>
+#include <asm/unwind.h>
 
 struct bpf_iter_target_info {
 	struct list_head list;
@@ -773,6 +774,93 @@ const struct bpf_func_proto bpf_loop_proto = {
 	.arg2_type	= ARG_PTR_TO_FUNC,
 	.arg3_type	= ARG_PTR_TO_STACK_OR_NULL,
 	.arg4_type	= ARG_ANYTHING,
+};
+
+BPF_CALL_4(bpf_loop_termination, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
+          u64, flags)
+{
+	bpf_callback_t callback = (bpf_callback_t)callback_fn;
+	unsigned long addr;
+	struct unwind_state state;
+	struct bpf_prog *prog = NULL;
+	u64 ret;
+	u32 i;
+
+	/* Note: these safety checks are also verified when bpf_loop
+	 * is inlined, be careful to modify this code in sync. See
+	 * function verifier.c:inline_bpf_loop.
+	 */
+	if (flags)
+	        return -EINVAL;
+	if (nr_loops > BPF_MAX_LOOPS)
+	        return -E2BIG;
+
+	for (unwind_start(&state, current, NULL, NULL); !unwind_done(&state);
+	     unwind_next_frame(&state)) {
+		addr = unwind_get_return_address(&state);
+		if (!addr)
+			break;
+
+		if (!is_bpf_text_address(addr)) {
+			BUG_ON("bpf_loop_termination: This should never happen\n");
+			break;
+		}
+
+		prog = bpf_prog_ksym_find(addr);
+		break;
+	}
+
+	for (i = 0; i < nr_loops; i++) {
+		if (!prog) {
+			// TODO: check a flag to terminate
+		}
+	        ret = callback((u64)i, (u64)(long)callback_ctx, 0, 0, 0);
+	        /* return value: 0 - continue, 1 - stop and return */
+	        if (ret)
+	                return i + 1;
+	}
+
+	return i;
+}
+
+const struct bpf_func_proto bpf_loop_termination_proto = {
+       .func           = bpf_loop_termination,
+       .gpl_only       = false,
+       .ret_type       = RET_INTEGER,
+       .arg1_type      = ARG_ANYTHING,
+       .arg2_type      = ARG_PTR_TO_FUNC,
+       .arg3_type      = ARG_PTR_TO_STACK_OR_NULL,
+       .arg4_type      = ARG_ANYTHING,
+};
+
+BPF_CALL_0(bpf_dummy_void) {
+	return 0;
+}
+
+const struct bpf_func_proto bpf_dummy_void_proto = {
+	.func           = bpf_dummy_void,
+	.gpl_only	= false,
+	.ret_type	= RET_VOID,
+};
+
+BPF_CALL_0(bpf_dummy_int) {
+	return -1;
+}
+
+const struct bpf_func_proto bpf_dummy_int_proto = {
+	.func		= bpf_dummy_int,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+};
+
+BPF_CALL_0(bpf_dummy_ptr_to_map) {
+	return 0;
+}
+
+const struct bpf_func_proto bpf_dummy_ptr_to_map_proto = {
+	.func		= bpf_dummy_ptr_to_map,
+	.gpl_only	= false,
+	.ret_type	= RET_PTR_TO_MAP_VALUE_OR_NULL,
 };
 
 struct bpf_iter_num_kern {
