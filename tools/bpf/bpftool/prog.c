@@ -1976,6 +1976,46 @@ static int do_profile(int argc, char **argv)
 	return 0;
 }
 
+static int do_terminate(int argc, char **argv)
+{
+	int prog_id, cpu_id;
+	
+	if (!REQ_ARGS(4))
+		return BAD_ARG();
+
+	if (!is_prefix(*argv, "id")) {
+		p_err("expected 'id', got: %s", *argv);
+		return -1;
+	}
+	NEXT_ARG();
+
+	prog_id = atoi(argv[0]);
+	if (prog_id <= 0) {
+		printf("Invalid prog_id: %d\n", prog_id);
+		return -1;
+	}
+	NEXT_ARG();
+	
+	if (!is_prefix(*argv, "cpu")) {
+		p_err("expected 'cpu', got: %s", *argv);
+		return -1;
+	}
+	NEXT_ARG();
+
+	cpu_id = atoi(argv[0]);
+	if (cpu_id < 0) {
+		printf("Invalid cpu_id: %d\n", cpu_id);
+		return -1;
+	}
+	
+	printf("Termination request is signalled for prog %d, cpu %d\n",
+			prog_id, cpu_id);
+	bpf_prog_terminate(prog_id, cpu_id);
+
+	return 0;
+
+}
+
 #else /* BPFTOOL_WITHOUT_SKELETONS */
 
 #include "profiler.skel.h"
@@ -2466,6 +2506,7 @@ static int do_help(int argc, char **argv)
 
 	fprintf(stderr,
 		"Usage: %1$s %2$s { show | list } [PROG]\n"
+		"	%1$s %2$s terminate PROG CPU\n"
 		"       %1$s %2$s dump xlated PROG [{ file FILE | [opcodes] [linum] [visual] }]\n"
 		"       %1$s %2$s dump jited  PROG [{ file FILE | [opcodes] [linum] }]\n"
 		"       %1$s %2$s pin   PROG FILE\n"
@@ -2525,6 +2566,7 @@ static const struct cmd cmds[] = {
 	{ "tracelog",	do_tracelog },
 	{ "run",	do_run },
 	{ "profile",	do_profile },
+	{ "terminate",	do_terminate },
 	{ 0 }
 };
 

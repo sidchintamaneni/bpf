@@ -704,6 +704,12 @@ struct bpf_token_create_opts {
 LIBBPF_API int bpf_token_create(int bpffs_fd,
 				struct bpf_token_create_opts *opts);
 
+
+/**
+ * TODO: Write comments
+ */
+LIBBPF_API int bpf_prog_terminate(int prog_id, int cpu_id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
