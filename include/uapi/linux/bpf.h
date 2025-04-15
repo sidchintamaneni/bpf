@@ -1847,7 +1847,6 @@ union bpf_attr {
 		__u32		prog_id;
 		__u32		term_cpu_id;
 	} prog_terminate;
-
 } __attribute__((aligned(8)));
 
 /* The description below is an attempt at providing documentation to eBPF
