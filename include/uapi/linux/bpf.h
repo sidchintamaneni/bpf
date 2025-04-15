@@ -961,6 +961,7 @@ enum bpf_cmd {
 	BPF_LINK_DETACH,
 	BPF_PROG_BIND_MAP,
 	BPF_TOKEN_CREATE,
+	BPF_PROG_TERMINATE,
 	__MAX_BPF_CMD,
 };
 
@@ -1841,6 +1842,11 @@ union bpf_attr {
 		__u32		flags;
 		__u32		bpffs_fd;
 	} token_create;
+
+	struct { /* struct used by BPF_PROG_TERMINATE command */
+		__u32		prog_id;
+		__u32		term_cpu_id;
+	} prog_terminate;
 
 } __attribute__((aligned(8)));
 
