@@ -6111,10 +6111,9 @@ static int token_create(union bpf_attr *attr)
 	return bpf_token_create(attr);
 }
 
-static bool per_cpu_flag_is_true(struct termination_aux_states *term_states)
+static bool per_cpu_flag_is_true(struct termination_aux_states *term_states, int cpu_id)
 {
 	unsigned long flags;
-	u32 cpu_id = raw_smp_processor_id();
 
 	spin_lock_irqsave(&term_states->per_cpu_state[cpu_id].lock, 
 				flags);
@@ -6190,7 +6189,7 @@ void bpf_die(void *data)
 	patch_prog = prog->termination_states->patch_prog;
 	regs = &prog->termination_states->pre_execution_state[cpu_id];
 
-	if(!per_cpu_flag_is_true(prog->termination_states))
+	if(!per_cpu_flag_is_true(prog->termination_states, cpu_id))
 		return;
 
 	unwind_start(&state, current, regs, NULL);
@@ -6241,7 +6240,7 @@ static int bpf_prog_terminate(union bpf_attr *attr)
 	if (cpu_id < 0 && cpu_id >= NR_CPUS)
 		return -EINVAL;
 
-	if (!per_cpu_flag_is_true(term_states))
+	if (!per_cpu_flag_is_true(term_states, cpu_id))
 		return -EFAULT;
 
 	smp_call_function_single(cpu_id, bpf_die, (void *)prog, 1);
