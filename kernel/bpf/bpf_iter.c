@@ -779,48 +779,9 @@ const struct bpf_func_proto bpf_loop_proto = {
 BPF_CALL_4(bpf_loop_termination, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
           u64, flags)
 {
-	bpf_callback_t callback = (bpf_callback_t)callback_fn;
-	unsigned long addr;
-	struct unwind_state state;
-	struct bpf_prog *prog = NULL;
-	u64 ret;
-	u32 i;
-
-	/* Note: these safety checks are also verified when bpf_loop
-	 * is inlined, be careful to modify this code in sync. See
-	 * function verifier.c:inline_bpf_loop.
-	 */
-	if (flags)
-	        return -EINVAL;
-	if (nr_loops > BPF_MAX_LOOPS)
-	        return -E2BIG;
-
-	for (unwind_start(&state, current, NULL, NULL); !unwind_done(&state);
-	     unwind_next_frame(&state)) {
-		addr = unwind_get_return_address(&state);
-		if (!addr)
-			break;
-
-		if (!is_bpf_text_address(addr)) {
-			BUG_ON("bpf_loop_termination: This should never happen\n");
-			break;
-		}
-
-		prog = bpf_prog_ksym_find(addr);
-		break;
-	}
-
-	for (i = 0; i < nr_loops; i++) {
-		if (!prog) {
-			// TODO: check a flag to terminate
-		}
-	        ret = callback((u64)i, (u64)(long)callback_ctx, 0, 0, 0);
-	        /* return value: 0 - continue, 1 - stop and return */
-	        if (ret)
-	                return i + 1;
-	}
-
-	return i;
+	// Since a patched BPF program for termination will want to finish as fast as possible, 
+	// we simply don't run any loop in here.
+	return 0;
 }
 
 const struct bpf_func_proto bpf_loop_termination_proto = {
