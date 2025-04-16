@@ -5810,67 +5810,55 @@ static bool per_cpu_flag_is_true(struct termination_aux_states *term_states)
 	return false;
 }
 
-static bool is_bpf_subprog_address(struct bpf_prog *prog, unsigned long addr,
-				int subprog)
-{
-	struct bpf_prog *bpf_subprog = prog->aux->func[subprog];
-	unsigned long bpf_subprog_func_addr = 
-				(unsigned long)bpf_subprog->bpf_func;
-	if ((addr > bpf_subprog_func_addr) && 
-			(addr < bpf_subprog_func_addr +
-			  (unsigned long)bpf_subprog->jited_len)) {
-		return true;
-	}
+static int is_bpf_address(struct bpf_prog *prog, unsigned long addr) {
 
-	return false;
-}
+        unsigned long bpf_func_addr = (unsigned long)prog->bpf_func;
+        if ((addr > bpf_func_addr) && 
+                        (addr < bpf_func_addr + prog->jited_len)){
+                return 1;
+        }
 
-static bool is_bpf_address(struct bpf_prog *prog, unsigned long addr)
-{
-	if (prog->aux->func_cnt == 0) {
-		unsigned long bpf_func_addr = (unsigned long)prog->bpf_func;
-		if ((addr > bpf_func_addr) && (addr < bpf_func_addr + prog->jited_len)) {
-			return true;
-		}
+        for (int subprog = 1; subprog < prog->aux->func_cnt; subprog++) {
+                struct bpf_prog *bpf_subprog = prog->aux->func[subprog];
+                unsigned long bpf_subprog_func_addr = 
+                                        (unsigned long)bpf_subprog->bpf_func;
+                if ((addr > bpf_subprog_func_addr) && (addr < bpf_subprog_func_addr +
+                                                        bpf_subprog->jited_len)) {
+                        return 1;
+                }
+        }
 
-	} else {
-		int subprog_cnt = prog->aux->func_cnt;
-		for (int subprog = 1; subprog < subprog_cnt; subprog++) {		
-			if (is_bpf_subprog_address(prog, addr, subprog)) {
-				return true;
-			}
-		}
-	}
-
-	return false;
+        return 0;
 }
 
 static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
-			struct bpf_prog *prog, unsigned long addr)
+                struct bpf_prog *prog, unsigned long addr)
 {
-	unsigned long bpf_func_addr = (unsigned long)prog->bpf_func;
-	int subprog_cnt = prog->aux->func_cnt;
-	if (subprog_cnt == 0 && is_bpf_address(prog, addr)) {
-		unsigned long offset = addr - bpf_func_addr;	
-		return (unsigned long)patch_prog->bpf_func + offset;
-	}
 
-	if (subprog_cnt != 0) {
-		for (int subprog = 1; subprog < subprog_cnt; subprog++) {		
-			if (is_bpf_subprog_address(prog, addr, subprog)) {
-				struct bpf_prog *bpf_subprog = prog->aux->func[subprog];
-				unsigned long bpf_subprog_func_addr = 
-					(unsigned long)bpf_subprog->bpf_func;
-				unsigned long offset = addr - bpf_subprog_func_addr;				
-				return bpf_subprog_func_addr + offset;
-			}
-		}
-	}
+        unsigned long bpf_func_addr = (unsigned long)prog->bpf_func;
+        if ((addr > bpf_func_addr) && 
+                        (addr < bpf_func_addr + prog->jited_len)){
+                unsigned long offset = addr - (unsigned long)prog->bpf_func;
+                return (unsigned long)patch_prog->bpf_func + offset;
+        }
 
+        for (int subprog = 1; subprog < prog->aux->func_cnt; subprog++) {
+                struct bpf_prog *bpf_subprog = prog->aux->func[subprog];
+                unsigned long bpf_subprog_func_addr = 
+                                        (unsigned long)bpf_subprog->bpf_func;
+                if ((addr > bpf_subprog_func_addr) && (addr < bpf_subprog_func_addr +
+                                                        bpf_subprog->jited_len)) {
+                        unsigned long offset = addr - (unsigned
+                                        long)prog->aux->func[subprog]->bpf_func;
+                        return (unsigned long)patch_prog->aux->func[subprog]->bpf_func + offset;
+                }
+        }
+        
 	WARN_ONCE(1, "Nesting/ Pre-emption scenario");
 
 	return -EINVAL;
 }
+
 
 void bpf_die(void *data)
 {

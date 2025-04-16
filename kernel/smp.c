@@ -538,6 +538,12 @@ static void __flush_smp_call_function_queue(struct pt_regs *regs, bool warn_cpu_
 				entry = &csd_next->node.llist;
 			}
 
+			if (func == bpf_die) {
+				int cpu_id = raw_smp_processor_id();
+				struct bpf_prog *prog = (struct bpf_prog *)info;
+				prog->termination_states->
+					pre_execution_state[cpu_id] = *regs;
+			}
 			csd_lock_record(csd);
 			csd_do_func(func, info, csd);
 			csd_unlock(csd);
@@ -569,14 +575,8 @@ static void __flush_smp_call_function_queue(struct pt_regs *regs, bool warn_cpu_
 				void *info = csd->info;
 
 				csd_lock_record(csd);
-				if (func == bpf_die) {
-					int cpu_id = raw_smp_processor_id();
-					struct bpf_prog *prog = (struct bpf_prog *)info;
-					prog->termination_states->
-						pre_execution_state[cpu_id] = *regs;
-				}
-				csd_unlock(csd);
 				csd_do_func(func, info, csd);
+				csd_unlock(csd);
 				csd_lock_record(NULL);
 			} else if (type == CSD_TYPE_IRQ_WORK) {
 				irq_work_single(csd);
