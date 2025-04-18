@@ -1968,14 +1968,6 @@ static int do_loadall(int argc, char **argv)
 	return load_with_options(argc, argv, false);
 }
 
-#ifdef BPFTOOL_WITHOUT_SKELETONS
-
-static int do_profile(int argc, char **argv)
-{
-	p_err("bpftool prog profile command is not supported. Please build bpftool with clang >= 10.0.0");
-	return 0;
-}
-
 static int do_terminate(int argc, char **argv)
 {
 	int prog_id, cpu_id;
@@ -2014,6 +2006,14 @@ static int do_terminate(int argc, char **argv)
 
 	return 0;
 
+}
+
+#ifdef BPFTOOL_WITHOUT_SKELETONS
+
+static int do_profile(int argc, char **argv)
+{
+	p_err("bpftool prog profile command is not supported. Please build bpftool with clang >= 10.0.0");
+	return 0;
 }
 
 #else /* BPFTOOL_WITHOUT_SKELETONS */
