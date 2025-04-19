@@ -5864,7 +5864,8 @@ void bpf_die(void *data)
 	struct unwind_state state;
 	struct bpf_prog *prog, *patch_prog;
 	struct pt_regs *regs;
-	unsigned long addr, new_addr;
+	char str[KSYM_SYMBOL_LEN];
+	unsigned long addr, new_addr, bpf_loop_addr, bpf_loop_term_addr;
 	int cpu_id = raw_smp_processor_id();
 
 	prog = (struct bpf_prog *)data;
@@ -5873,6 +5874,12 @@ void bpf_die(void *data)
 
 	if(!per_cpu_flag_is_true(prog->termination_states, cpu_id))
 		return;
+	
+	bpf_loop_addr = (unsigned long)bpf_loop_proto.func;
+	bpf_loop_term_addr = (unsigned long)bpf_loop_termination_proto.func;
+
+	pr_info("bpf_die: bpf_loop_addr 0x%lx\n", bpf_loop_addr);
+	pr_info("bpf_die: bpf_loop_term_addr 0x%lx\n", bpf_loop_term_addr);
 
 	unwind_start(&state, current, regs, NULL);
 
@@ -5895,6 +5902,19 @@ void bpf_die(void *data)
 			if (new_addr < 0)
 				return;
 			*(unsigned long *)stack_addr = new_addr;
+		} else {
+			const char *name = kallsyms_lookup(addr, NULL, NULL, NULL, str);	
+			if (name) {
+				unsigned long lookup_addr = kallsyms_lookup_name(name);
+				if (lookup_addr && lookup_addr == bpf_loop_addr) {
+					pr_info("bpf_die: bpf_loop function is found on the stack\n");	
+					while (*(unsigned long *)stack_addr != addr) {
+						stack_addr += 1;
+					}
+					pr_info("bpf_die: stack_addr 0x%lx is replaced by 0x%lx\n", stack_addr, bpf_loop_term_addr);
+					*(unsigned long *)stack_addr = bpf_loop_term_addr;
+				}
+			}
 		}
 		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
