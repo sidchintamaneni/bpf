@@ -2783,8 +2783,6 @@ static int clone_bpf_prog(struct bpf_prog *patch_prog, struct bpf_prog *prog)
 	patch_prog->jited = 0;
 	patch_prog->type = prog->type; // TODO: check if type is missing
 
-	bpf_prog_inc(patch_prog);
-
 	char *patch_prefix = "patch_";
 	strncpy(patch_prog->aux->name, patch_prefix, strlen(patch_prefix));
 	strncat(patch_prog->aux->name, prog->aux->name, sizeof(prog->aux->name));
@@ -2881,6 +2879,14 @@ static void compare_bpf_progs_after_ver(struct bpf_prog *patch_prog, struct bpf_
 static bool is_verifier_inlined_function(int func_id) {
 	switch (func_id) {
 		case BPF_FUNC_get_smp_processor_id:
+		case BPF_FUNC_jiffies64:
+		case BPF_FUNC_get_func_arg:
+		case BPF_FUNC_get_func_ret:
+		case BPF_FUNC_get_func_arg_cnt:
+		case BPF_FUNC_get_func_ip:
+		case BPF_FUNC_get_branch_snapshot:
+		case BPF_FUNC_kptr_xchg:
+		case BPF_FUNC_map_lookup_elem:
 			return true;
 		default:
 			return false;
@@ -2899,7 +2905,8 @@ static bool is_debug_function(int func_id) {
 static bool is_resource_release_function(int func_id) {
 	switch (func_id) {
 		case BPF_FUNC_spin_unlock:
-		case BPF_FUNC_sk_release:
+		case BPF_FUNC_ringbuf_submit:
+		case BPF_FUNC_ringbuf_discard:
 			return true;
 		default:
 			return false;
@@ -2957,7 +2964,6 @@ static void patch_generator(struct bpf_prog *prog)
 
 	struct call_insn_aux *call_indices;
 	int num_calls=0;
-	int err;
 	call_indices = vmalloc(sizeof(call_indices) * prog->len);
 
 	pr_info("Running patch_gen for prog name : %s\n", prog->aux->name);
@@ -3020,15 +3026,16 @@ static void patch_generator(struct bpf_prog *prog)
 	}
 }
 
-static bool create_termination_prog(struct bpf_prog *patch_prog,
-									struct bpf_prog *prog,
-									union bpf_attr *attr,
-									bpfptr_t uattr,
-									u32 uattr_size)
+static bool create_termination_prog(struct bpf_prog *prog,
+					union bpf_attr *attr,
+					bpfptr_t uattr,
+					u32 uattr_size)
 {
-	if (prog->len<10)
+	if (prog->len < 10)
 		return false;
+
 	int err;
+	struct bpf_prog *patch_prog;
 	pr_info("create_termination_prog: patch_prog alloc\n");
 	patch_prog = bpf_prog_alloc_no_stats(bpf_prog_size(prog->len), 0);
 	if (!patch_prog) {
@@ -3071,8 +3078,6 @@ free_termination_prog:
 	free_percpu(patch_prog->stats);
 	free_percpu(patch_prog->active);
 	kfree(patch_prog->aux);
-	vfree(patch_prog);
-	bpf_prog_sub(patch_prog, 1);
 	__bpf_prog_put_noref(patch_prog, patch_prog->aux->real_func_cnt);
 	return false;
 }
@@ -3289,7 +3294,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (err)
 		goto free_prog_sec;
 
-	have_termination_prog = create_termination_prog(patch_prog, prog, attr, uattr, uattr_size);	
+	have_termination_prog = create_termination_prog( prog, attr, uattr, uattr_size);
 
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
@@ -3304,7 +3309,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	// DEBUG: Remove later
 	if (have_termination_prog) {
 		pr_info("bpf_prog_load: patch_prog compare after patching and verification\n");
-		compare_bpf_progs_after_ver(patch_prog, prog);
+		compare_bpf_progs_after_ver(prog->termination_states->patch_prog, prog);
 	}
 
 	err = bpf_prog_alloc_id(prog);
