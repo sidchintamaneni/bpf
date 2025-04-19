@@ -3078,14 +3078,13 @@ free_termination_prog:
 	free_percpu(patch_prog->stats);
 	free_percpu(patch_prog->active);
 	kfree(patch_prog->aux);
-	__bpf_prog_put_noref(patch_prog, patch_prog->aux->real_func_cnt);
 	return false;
 }
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
 	enum bpf_prog_type type = attr->prog_type;
-	struct bpf_prog *prog, *patch_prog, *dst_prog = NULL;
+	struct bpf_prog *prog, *dst_prog = NULL;
 	struct btf *attach_btf = NULL;
 	struct bpf_token *token = NULL;
 	bool bpf_cap;
@@ -6254,7 +6253,8 @@ void bpf_die(void *data)
 		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
 	}
-
+	
+	atomic64_dec(&prog->aux->refcnt);
 
 	return;
 }
