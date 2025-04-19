@@ -5920,6 +5920,7 @@ void bpf_die(void *data)
 		addr = unwind_get_return_address(&state);
 	}
 
+	atomic64_dec(&prog->aux->refcnt);
 
 	return;
 }
