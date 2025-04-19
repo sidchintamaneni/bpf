@@ -778,9 +778,20 @@ const struct bpf_func_proto bpf_loop_proto = {
 
 BPF_CALL_4(bpf_loop_termination, u32, nr_loops, void *, callback_fn, void *, callback_ctx,
           u64, flags)
+<<<<<<< Updated upstream
 {
 	// Since a patched BPF program for termination will want to finish as fast as possible, 
 	// we simply don't run any loop in here.
+=======
+{	
+
+	asm volatile(
+	"pop %rbx\n\t"
+	"pop %rbp\n\t"
+	"pop %r12\n\t"
+	"pop %r13\n\t"
+	);
+>>>>>>> Stashed changes
 	return 0;
 }
 
