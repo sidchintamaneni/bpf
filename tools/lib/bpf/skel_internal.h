@@ -27,6 +27,41 @@
 # endif
 #endif
 
+
+static inline bool is_mem_zeroed(const char *p, ssize_t len)
+{
+	while (len > 0) {
+		if (*p)
+			return false;
+		p++;
+		len--;
+	}
+	return true;
+}
+
+static inline bool validate_opts(const char *opts,
+				size_t opts_sz, size_t user_sz,
+				const char *type_name)
+{
+	if (user_sz < sizeof(size_t)) {
+		return false;
+	}
+	if (!is_mem_zeroed(opts + opts_sz, (ssize_t)user_sz - opts_sz)) {
+		return false;
+	}
+	return true;
+}
+
+#define LSKEL_OPTS_VALID(opts, type)					      \
+	(!(opts) || validate_opts((const char *)opts,			      \
+					 offsetofend(struct type,	      \
+						     type##__last_field),     \
+					 (opts)->sz, #type))
+#define LSKEL_OPTS_HAS(opts, field) \
+	((opts) && opts->sz >= offsetofend(typeof(*(opts)), field))
+#define LSKEL_OPTS_GET(opts, field, fallback_value) \
+	(LSKEL_OPTS_HAS(opts, field) ? (opts)->field : fallback_value)
+
 /* This file is a base header for auto-generated *.lskel.h files.
  * Its contents will change and may become part of auto-generation in the future.
  *
@@ -56,6 +91,14 @@ struct bpf_loader_ctx {
 	__u32 log_size;
 	__u64 log_buf;
 };
+
+struct bpf_ctx_open_opts {
+	__u32 sz;
+	char* kernel_log_buf;
+	__u64 kernel_log_size;
+	__u32 kernel_log_level;
+};
+#define bpf_ctx_open_opts__last_field kernel_log_level
 
 struct bpf_load_and_run_opts {
 	struct bpf_loader_ctx *ctx;
@@ -305,6 +348,29 @@ static inline int skel_link_create(int prog_fd, int target_fd,
 #else
 #define set_err err = -errno
 #endif
+static inline int bpf_ctx_update_opts(struct bpf_loader_ctx *ctx,
+					const struct bpf_ctx_open_opts *opts) {
+	char *log_buf;
+	size_t log_size;
+	__u32 log_level;
+
+	if (!LSKEL_OPTS_VALID(opts, bpf_ctx_open_opts))
+		return -EINVAL;
+
+	log_buf = LSKEL_OPTS_GET(opts, kernel_log_buf, NULL);
+	log_size = LSKEL_OPTS_GET(opts, kernel_log_size, 0);
+	log_level = LSKEL_OPTS_GET(opts, kernel_log_level, 0);
+	if (log_size > sizeof(__u64))
+		return -EINVAL;
+	if (log_size && !log_buf)
+		return -EINVAL;
+
+	ctx->log_buf = (__u64)log_buf;
+	ctx->log_size = log_size;
+	ctx->log_level = log_level;
+
+	return 0;
+}
 
 static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 {

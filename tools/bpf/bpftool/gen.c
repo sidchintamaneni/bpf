@@ -719,9 +719,10 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 	codegen("\
 		\n\
 		static inline struct %1$s *				    \n\
-		%1$s__open(void)					    \n\
+		%1$s__open_opts(const struct bpf_ctx_open_opts *opts)       \n\
 		{							    \n\
 			struct %1$s *skel;				    \n\
+			int err;					    \n\
 									    \n\
 			skel = skel_alloc(sizeof(*skel));		    \n\
 			if (!skel)					    \n\
@@ -757,12 +758,18 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 	}
 	codegen("\
 		\n\
+			err = bpf_ctx_update_opts(&skel->ctx, opts);	    \n\
 			return skel;					    \n\
 		cleanup:						    \n\
 			%1$s__destroy(skel);				    \n\
 			return NULL;					    \n\
 		}							    \n\
 									    \n\
+		static inline struct %1$s *				    \n\
+		%1$s__open(void)					    \n\
+		{							    \n\
+			return %1$s__open_opts(NULL);			    \n\
+		}							    \n\
 		static inline int					    \n\
 		%1$s__load(struct %1$s *skel)				    \n\
 		{							    \n\
