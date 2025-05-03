@@ -6,6 +6,7 @@
 #include <linux/filter.h>
 #include <linux/bpf.h>
 #include <linux/rcupdate_trace.h>
+#include <asm/unwind.h>
 
 struct bpf_iter_target_info {
 	struct list_head list;
