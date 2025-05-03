@@ -1965,6 +1965,12 @@ bpf_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_get_current_pid_tgid_proto;
 	case BPF_FUNC_get_ns_current_pid_tgid:
 		return &bpf_get_ns_current_pid_tgid_proto;
+	case BPF_FUNC_dummy_void:
+		return &bpf_dummy_void_proto;
+	case BPF_FUNC_dummy_int:
+		return &bpf_dummy_int_proto;
+	case BPF_FUNC_dummy_ptr_to_map:
+		return &bpf_dummy_ptr_to_map_proto;
 	default:
 		break;
 	}
@@ -1997,6 +2003,8 @@ bpf_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_for_each_map_elem_proto;
 	case BPF_FUNC_loop:
 		return &bpf_loop_proto;
+	case BPF_FUNC_loop_termination:
+		return &bpf_loop_termination_proto;
 	case BPF_FUNC_user_ringbuf_drain:
 		return &bpf_user_ringbuf_drain_proto;
 	case BPF_FUNC_ringbuf_reserve_dynptr:
@@ -2504,6 +2512,37 @@ const struct bpf_func_proto bpf_current_task_under_cgroup_proto = {
 	.arg1_type      = ARG_CONST_MAP_PTR,
 	.arg2_type      = ARG_ANYTHING,
 };
+
+BPF_CALL_0(bpf_dummy_void) {
+	return 0;
+}
+
+const struct bpf_func_proto bpf_dummy_void_proto = {
+	.func           = bpf_dummy_void,
+	.gpl_only	= false,
+	.ret_type	= RET_VOID,
+};
+
+BPF_CALL_0(bpf_dummy_int) {
+	return -1;
+}
+
+const struct bpf_func_proto bpf_dummy_int_proto = {
+	.func		= bpf_dummy_int,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+};
+
+BPF_CALL_0(bpf_dummy_ptr_to_map) {
+	return 0;
+}
+
+const struct bpf_func_proto bpf_dummy_ptr_to_map_proto = {
+	.func		= bpf_dummy_ptr_to_map,
+	.gpl_only	= false,
+	.ret_type	= RET_PTR_TO_MAP_VALUE_OR_NULL,
+};
+
 
 /**
  * bpf_task_get_cgroup1 - Acquires the associated cgroup of a task within a
