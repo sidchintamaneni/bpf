@@ -58,6 +58,7 @@ struct bpf_token;
 struct user_namespace;
 struct super_block;
 struct inode;
+struct termination_aux_states;
 
 extern struct idr btf_idr;
 extern spinlock_t btf_idr_lock;
@@ -1518,6 +1519,10 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct termination_aux_states {
+	struct bpf_prog *patch_prog;
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1656,6 +1661,7 @@ struct bpf_prog {
 					    const struct bpf_insn *insn);
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+	struct termination_aux_states *termination_states;
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);

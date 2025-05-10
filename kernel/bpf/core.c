@@ -99,6 +99,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	gfp_t gfp_flags = bpf_memcg_flags(GFP_KERNEL | __GFP_ZERO | gfp_extra_flags);
 	struct bpf_prog_aux *aux;
 	struct bpf_prog *fp;
+	struct termination_aux_states *termination_states = NULL;
 
 	size = round_up(size, __PAGE_SIZE);
 	fp = __vmalloc(size, gfp_flags);
@@ -116,12 +117,18 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 		kfree(aux);
 		return NULL;
 	}
-
+	
+	// Why kzalloc? why not vmalloc?
+	termination_states = kzalloc(sizeof(*termination_states), gfp_flags);
+	if(!termination_states)
+		goto free_alloc_percpu;
+	
 	fp->pages = size / PAGE_SIZE;
 	fp->aux = aux;
 	fp->aux->prog = fp;
 	fp->jit_requested = ebpf_jit_enabled();
 	fp->blinding_requested = bpf_jit_blinding_enabled(fp);
+	fp->termination_states = termination_states;
 #ifdef CONFIG_CGROUP_BPF
 	aux->cgroup_atype = CGROUP_BPF_ATTACH_TYPE_INVALID;
 #endif
@@ -135,6 +142,12 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	mutex_init(&fp->aux->dst_mutex);
 
 	return fp;
+
+free_alloc_percpu:
+	free_percpu(fp->active);
+	kfree(aux);
+	vfree(fp);
+	return NULL;
 }
 
 struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
@@ -281,6 +294,9 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		kfree(fp->aux->poke_tab);
 		kfree(fp->aux);
+	}
+	if (fp->termination_states) {
+		kfree(fp->termination_states);
 	}
 	free_percpu(fp->stats);
 	free_percpu(fp->active);

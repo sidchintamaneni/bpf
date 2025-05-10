@@ -21322,13 +21322,24 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 	bool has_kfunc_call = bpf_prog_has_kfunc_call(prog);
 	int i, depth;
 #endif
+	struct bpf_verifier_env *patch_env;
+	struct bpf_prog *patch_prog = env->prog->termination_states->patch_prog;
 	int err = 0;
 
 	if (env->prog->jit_requested &&
 	    !bpf_prog_is_offloaded(env->prog->aux)) {
 		err = jit_subprogs(env);
-		if (err == 0)
-			return 0;
+		if (err == 0) {
+			patch_env = kvzalloc(sizeof(*env), GFP_KERNEL);
+			if (!patch_env)
+				return -ENOMEM;
+			memcpy(patch_env, env, sizeof(*env));
+			patch_env->prog = patch_prog;
+			err = jit_subprogs(patch_env);
+			kvfree(patch_env);
+			if (err == 0)
+				return 0;
+		}
 		if (err == -EFAULT)
 			return err;
 	}
@@ -23931,6 +23942,92 @@ out:
 	return err;
 }
 
+static void debug_bpf_prog(struct bpf_prog *prog)
+{
+	pr_info("debug_bpf_prog: DEBUG INFO\n");
+	pr_info("debug_bpf_prog: prog->aux->name - %s\n", prog->aux->name);
+	pr_info("debug_bpf_prog: prog->len - %d\n", prog->len);
+
+	for(int i = 0; i < prog->len; i++) {
+		pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", prog->insnsi[i].code,
+                               prog->insnsi[i].dst_reg,
+                               prog->insnsi[i].src_reg,
+                               prog->insnsi[i].off,
+                               prog->insnsi[i].imm);
+	}
+
+	pr_info("prog->subprogs count %d\n", prog->aux->func_cnt);
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		pr_info("subprog[%d] - jited_len %d\n", 
+				subprog, prog->aux->func[subprog]->jited_len);
+		for (int i = 0; i < prog->len; i++) {
+			pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n",
+					prog->aux->func[subprog]->insnsi[i].code,
+					prog->aux->func[subprog]->insnsi[i].dst_reg,
+					prog->aux->func[subprog]->insnsi[i].src_reg,
+       			                prog->aux->func[subprog]->insnsi[i].off,
+					prog->aux->func[subprog]->insnsi[i].imm);
+		}
+	}
+
+}
+
+static int clone_patch_prog(struct bpf_verifier_env *env)
+{
+	/*
+	 * Do we need a GFP_USER flag here?
+	 */
+	gfp_t gfp_flags = bpf_memcg_flags(GFP_KERNEL | __GFP_ZERO | GFP_USER);
+	unsigned int size, prog_name_len;
+	struct bpf_prog *patch_prog, *prog = env->prog;
+	struct bpf_prog_aux *aux;
+
+	size = prog->pages * PAGE_SIZE;
+	pr_info("clone_patch_prog: prog size: %d\n", size);
+	patch_prog = __vmalloc(size, gfp_flags);
+	if (!patch_prog)
+		return -ENOMEM;
+
+	/*
+	 * Do we need a GFP_USER flag here?
+	 */
+	aux = kzalloc(sizeof(*aux), bpf_memcg_flags(GFP_KERNEL | GFP_USER));
+	if (aux == NULL) {
+		vfree(patch_prog);
+		return -ENOMEM;
+	}
+
+	patch_prog->pages = prog->pages;
+	patch_prog->jited = 0;
+	patch_prog->jit_requested = prog->jit_requested;
+	patch_prog->gpl_compatible = prog->gpl_compatible;
+	patch_prog->blinding_requested = prog->blinding_requested;
+	/*
+	 * TODO: Do we have to populate remaining fields
+	 * in bpf_prog struct?
+	 */
+	patch_prog->len = prog->len;
+	patch_prog->type = prog->type;
+	patch_prog->aux = aux;
+
+	memcpy(patch_prog->insnsi, prog->insnsi, bpf_prog_insn_size(prog));
+
+	char *patch_prefix = "patch_";
+	prog_name_len = strlen(prog->aux->name);
+	strncpy(patch_prog->aux->name, patch_prefix, strlen(patch_prefix));
+	if (prog_name_len + strlen(patch_prefix) > BPF_OBJ_NAME_LEN) {
+		prog_name_len = BPF_OBJ_NAME_LEN - strlen(patch_prefix);
+	}
+	strncat(patch_prog->aux->name, prog->aux->name, prog_name_len);
+
+	pr_info("clone_patch_prog: patch_prog name: %s\n", patch_prog->aux->name);
+	pr_info("clone_patch_prog: compare prog insns after cloning\n");
+
+	prog->termination_states->patch_prog = patch_prog;
+
+	return 0;
+}
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -24110,8 +24207,31 @@ skip_full_check:
 								     : false;
 	}
 
+	/*
+	 * Cloning the patch_prog happens here
+	 * Here?
+	 * 1. It happens after do_misc_fixups() -> which does bunch of 
+	 *    helper inlining.
+	 * 2. Before fix_call_args() -> the jiting of subprogs.
+	 */
+	pr_info("bpf_check: clone_patch_prog\n");
+	if (ret == 0)
+		ret = clone_patch_prog(env);
+	
+	pr_info("bpf_check: Before fixup_call_args()\n");
+	pr_info("bpf_check: prog\n");
+	debug_bpf_prog(env->prog);
+	pr_info("bpf_check: patch_prog\n");
+	debug_bpf_prog(env->prog->termination_states->patch_prog);
+
 	if (ret == 0)
 		ret = fixup_call_args(env);
+
+	pr_info("bpf_check: After fixup_call_args()\n");
+	pr_info("bpf_check: prog\n");
+	debug_bpf_prog(env->prog);
+	pr_info("bpf_check: patch_prog\n");
+	debug_bpf_prog(env->prog->termination_states->patch_prog);
 
 	env->verification_time = ktime_get_ns() - start_time;
 	print_verification_stats(env);
