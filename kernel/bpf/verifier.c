@@ -21582,10 +21582,15 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 	struct bpf_insn *insn_buf = env->insn_buf;
 	struct bpf_prog *new_prog;
 	struct bpf_map *map_ptr;
-	int i, ret, cnt, delta = 0, cur_subprog = 0;
+	struct call_insn_aux *call_indices;
+	int i, ret, cnt, delta = 0, cur_subprog = 0, num_calls = 0;
 	struct bpf_subprog_info *subprogs = env->subprog_info;
 	u16 stack_depth = subprogs[cur_subprog].stack_depth;
 	u16 stack_depth_extra = 0;
+
+	call_indices = vmalloc(sizeof(call_indices) * prog->len);
+	if (!call_indices)
+		return -ENOMEM;
 
 	if (env->seen_exception && !env->exception_callback_subprog) {
 		struct bpf_insn patch[] = {
@@ -22404,6 +22409,8 @@ patch_map_ops_generic:
 		}
 patch_call_imm:
 		fn = env->ops->get_func_proto(insn->imm, env->prog);
+		//pr_info("do_misc_fixups: helper call %s#%d\n", 
+		//		func_id_name(insn->imm), insn->imm);
 		/* all functions that have prototype and verifier allowed
 		 * programs to call them, must be real in-kernel functions
 		 */
@@ -22413,6 +22420,9 @@ patch_call_imm:
 				func_id_name(insn->imm), insn->imm);
 			return -EFAULT;
 		}
+		call_indices[num_calls].insn_idx = i + delta;
+		call_indices[num_calls].helper_id = insn->imm;
+		num_calls++;
 		insn->imm = fn->func - __bpf_call_base;
 next_insn:
 		if (subprogs[cur_subprog + 1].start == i + delta + 1) {
@@ -22433,6 +22443,8 @@ next_insn:
 		insn++;
 	}
 
+	env->prog->termination_states->call_sites = num_calls;
+	env->prog->termination_states->call_indices = call_indices;
 	env->prog->aux->stack_depth = subprogs[0].stack_depth;
 	for (i = 0; i < env->subprog_cnt; i++) {
 		int delta = bpf_jit_supports_timed_may_goto() ? 2 : 1;
@@ -24015,8 +24027,8 @@ static int clone_patch_prog(struct bpf_verifier_env *env)
 	char *patch_prefix = "patch_";
 	prog_name_len = strlen(prog->aux->name);
 	strncpy(patch_prog->aux->name, patch_prefix, strlen(patch_prefix));
-	if (prog_name_len + strlen(patch_prefix) > BPF_OBJ_NAME_LEN) {
-		prog_name_len = BPF_OBJ_NAME_LEN - strlen(patch_prefix);
+	if (prog_name_len + strlen(patch_prefix) + 1 > BPF_OBJ_NAME_LEN) {
+		prog_name_len = BPF_OBJ_NAME_LEN - strlen(patch_prefix) - 1;
 	}
 	strncat(patch_prog->aux->name, prog->aux->name, prog_name_len);
 
@@ -24197,6 +24209,17 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = do_misc_fixups(env);
+	pr_info("bpf_check: after do_misc_fixups\n");
+	pr_info("bpf_check: bpf prog call_sites: %d\n", 
+			env->prog->termination_states->call_sites);
+	/*
+	 * Free the call_indices
+	 */
+	for (int i = 0; i < env->prog->termination_states->call_sites; i++) {
+		pr_info("bpf_check: helper - %s#%d\n",
+				func_id_name(env->prog->termination_states->call_indices[i].helper_id),
+				env->prog->termination_states->call_indices[i].insn_idx);
+	}
 
 	/* do 32-bit optimization after insn patching has done so those patched
 	 * insns could be handled correctly.
