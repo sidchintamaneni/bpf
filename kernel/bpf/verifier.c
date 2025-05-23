@@ -21437,14 +21437,21 @@ static void __fixup_collection_insert_kfunc(struct bpf_insn_aux_data *insn_aux,
 }
 
 static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			    struct bpf_insn *insn_buf, int insn_idx, int *cnt)
+			    struct bpf_insn *insn_buf, int insn_idx, int *cnt,
+			    int *kfunc_btf_id)
 {
 	const struct bpf_kfunc_desc *desc;
+	struct bpf_kfunc_call_arg_meta meta;
+	int err;
 
 	if (!insn->imm) {
 		verbose(env, "invalid kernel function call not eliminated in verifier pass\n");
 		return -EINVAL;
 	}
+
+	err = fetch_kfunc_meta(env, insn, &meta, NULL);
+	if (err)
+		return err;
 
 	*cnt = 0;
 
@@ -21458,9 +21465,15 @@ static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			insn->imm);
 		return -EFAULT;
 	}
-
-	if (!bpf_jit_supports_far_kfunc_call())
+	
+	if (!bpf_jit_supports_far_kfunc_call()) {
+		pr_info("fixup_kfunc_call: kfunc ret_flags 0x%x\n", meta.kfunc_flags);
+		pr_info("fixup_kfunc_call: is_kfunc_ret_null 0x%x\n", is_kfunc_ret_null(&meta));
+		if ((meta.kfunc_flags ^ KF_RET_NULL) == 0) {
+			*kfunc_btf_id = insn->imm;
+		}
 		insn->imm = BPF_CALL_IMM(desc->addr);
+	}
 	if (insn->off)
 		return 0;
 	if (desc->func_id == special_kfunc_list[KF_bpf_obj_new_impl] ||
@@ -21927,11 +21940,13 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		if (insn->src_reg == BPF_PSEUDO_CALL)
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
-			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt);
+			int kfunc_btf_id = 0;
+			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt,
+						&kfunc_btf_id);
 			if (ret)
 				return ret;
 			if (cnt == 0)
-				goto next_insn;
+				goto store_call_indices;	
 
 			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
 			if (!new_prog)
@@ -21940,6 +21955,13 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			delta	 += cnt - 1;
 			env->prog = prog = new_prog;
 			insn	  = new_prog->insnsi + i + delta;
+store_call_indices:
+			if (kfunc_btf_id != 0) {
+				call_indices[num_calls].insn_idx = i + delta;
+				call_indices[num_calls].helper_id = kfunc_btf_id;
+				num_calls++;
+			}
+
 			goto next_insn;
 		}
 
@@ -22420,9 +22442,12 @@ patch_call_imm:
 				func_id_name(insn->imm), insn->imm);
 			return -EFAULT;
 		}
-		call_indices[num_calls].insn_idx = i + delta;
-		call_indices[num_calls].helper_id = insn->imm;
-		num_calls++;
+
+		if (fn->ret_type & PTR_MAYBE_NULL) {
+			call_indices[num_calls].insn_idx = i + delta;
+			call_indices[num_calls].helper_id = insn->imm;
+			num_calls++;
+		}
 		insn->imm = fn->func - __bpf_call_base;
 next_insn:
 		if (subprogs[cur_subprog + 1].start == i + delta + 1) {
@@ -23984,6 +24009,20 @@ static void debug_bpf_prog(struct bpf_prog *prog)
 
 }
 
+static void patch_helper_kfunc(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	struct termination_aux_states *termination_states = prog->termination_states;
+	struct bpf_prog *patch_prog = termination_states->patch_prog;
+	struct call_insn_aux call_indices;
+	int call_sites = termination_states->call_sites;
+
+	for (int idx = 0; idx < call_sites; idx++) {
+		call_indices = termination_states->call_indices[idx];
+		patch_prog->insnsi[call_indices.insn_idx] = NOP; 
+	}
+}
+
 static int clone_patch_prog(struct bpf_verifier_env *env)
 {
 	/*
@@ -24207,16 +24246,29 @@ skip_full_check:
 		/* program is valid, convert *(u32*)(ctx + off) accesses */
 		ret = convert_ctx_accesses(env);
 
+	pr_info("bpf_check: before do_misc_fixups\n");
+	pr_info("bpf_check: prog\n");
+
+	if (ret == 0)
+		debug_bpf_prog(env->prog);
+
 	if (ret == 0)
 		ret = do_misc_fixups(env);
-	pr_info("bpf_check: after do_misc_fixups\n");
-	pr_info("bpf_check: bpf prog call_sites: %d\n", 
-			env->prog->termination_states->call_sites);
+
+	if (ret == 0) {
+		pr_info("bpf_check: after do_misc_fixups\n");
+		pr_info("bpf_check: bpf prog call_sites: %d\n", 
+				env->prog->termination_states->call_sites);
+	}
 	/*
 	 * Free the call_indices
+	 * Note: The reason for storing call_sites of helper functions
+	 * is inside the do_misc_fixups helper function id is replaced
+	 * by it relative address
 	 */
 	for (int i = 0; i < env->prog->termination_states->call_sites; i++) {
-		pr_info("bpf_check: helper - %s#%d\n",
+		pr_info("bpf_check: helper(0x%x) - %s#%d\n",
+				env->prog->termination_states->call_indices[i].helper_id,
 				func_id_name(env->prog->termination_states->call_indices[i].helper_id),
 				env->prog->termination_states->call_indices[i].insn_idx);
 	}
@@ -24241,20 +24293,30 @@ skip_full_check:
 	if (ret == 0)
 		ret = clone_patch_prog(env);
 	
-	pr_info("bpf_check: Before fixup_call_args()\n");
-	pr_info("bpf_check: prog\n");
-	debug_bpf_prog(env->prog);
-	pr_info("bpf_check: patch_prog\n");
-	debug_bpf_prog(env->prog->termination_states->patch_prog);
+	if (ret == 0) {
+		pr_info("bpf_check: Before fixup_call_args()\n");
+		pr_info("bpf_check: prog\n");
+		debug_bpf_prog(env->prog);
+		pr_info("bpf_check: patch_prog\n");
+		debug_bpf_prog(env->prog->termination_states->patch_prog);
+	}
+
+	/*
+	 * Patching kfuncs and helpers before jit
+	 */
+	if (ret == 0) 
+		patch_helper_kfunc(env);
 
 	if (ret == 0)
 		ret = fixup_call_args(env);
 
-	pr_info("bpf_check: After fixup_call_args()\n");
-	pr_info("bpf_check: prog\n");
-	debug_bpf_prog(env->prog);
-	pr_info("bpf_check: patch_prog\n");
-	debug_bpf_prog(env->prog->termination_states->patch_prog);
+	if (ret == 0) {
+		pr_info("bpf_check: After fixup_call_args()\n"); 
+		pr_info("bpf_check: prog\n"); 
+		debug_bpf_prog(env->prog); 
+		pr_info("bpf_check: patch_prog\n");
+		debug_bpf_prog(env->prog->termination_states->patch_prog);
+	}
 
 	env->verification_time = ktime_get_ns() - start_time;
 	print_verification_stats(env);
