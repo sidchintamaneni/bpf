@@ -21469,7 +21469,7 @@ static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (!bpf_jit_supports_far_kfunc_call()) {
 		pr_info("fixup_kfunc_call: kfunc ret_flags 0x%x\n", meta.kfunc_flags);
 		pr_info("fixup_kfunc_call: is_kfunc_ret_null 0x%x\n", is_kfunc_ret_null(&meta));
-		if ((meta.kfunc_flags ^ KF_RET_NULL) == 0) {
+		if (meta.kfunc_flags & KF_RET_NULL) {
 			*kfunc_btf_id = insn->imm;
 		}
 		insn->imm = BPF_CALL_IMM(desc->addr);
@@ -24019,7 +24019,8 @@ static void patch_helper_kfunc(struct bpf_verifier_env *env)
 
 	for (int idx = 0; idx < call_sites; idx++) {
 		call_indices = termination_states->call_indices[idx];
-		patch_prog->insnsi[call_indices.insn_idx] = NOP; 
+		patch_prog->insnsi[call_indices.insn_idx].imm = 
+			BPF_CALL_IMM(bpf_termination_null_func);
 	}
 }
 
