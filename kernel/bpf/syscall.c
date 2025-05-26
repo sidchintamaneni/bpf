@@ -2757,10 +2757,47 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
+struct jit_context {
+	int cleanup_addr; /* Epilogue code offset */
+
+	/*
+	 * Program specific offsets of labels in the code; these rely on the
+	 * JIT doing at least 2 passes, recording the position on the first
+	 * pass, only to generate the correct offset on the second pass.
+	 */
+	int tail_call_direct_label;
+	int tail_call_indirect_label;
+};
+
+
+struct x64_jit_data {
+	struct bpf_binary_header *rw_header;
+	struct bpf_binary_header *header;
+	int *addrs;
+	u8 *image;
+	int proglen;
+	struct jit_context ctx;
+};
+
+static int cmp_jit_data(struct bpf_prog *prog) {
+	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;	
+
+	pr_info("cmp_jit_data: prog->bpf_func 0x%p\n", prog->bpf_func);
+	pr_info("cmp_jit_data: patch_prog->bpf_func 0x%p\n", patch_prog->bpf_func);
+
+	print_hex_dump(KERN_INFO, "JIT code: prog", DUMP_PREFIX_ADDRESS,
+		16, 1, prog->bpf_func, prog->jited_len, false);
+
+	print_hex_dump(KERN_INFO, "JIT code: patch_prog", DUMP_PREFIX_ADDRESS,
+		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
+
+	return 0;
+}
+
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
 	enum bpf_prog_type type = attr->prog_type;
-	struct bpf_prog *prog, *dst_prog = NULL;
+	struct bpf_prog *prog, *patch_prog = NULL, *dst_prog = NULL;
 	struct btf *attach_btf = NULL;
 	struct bpf_token *token = NULL;
 	bool bpf_cap;
@@ -2976,6 +3013,41 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
+
+	patch_prog = prog->termination_states->patch_prog;
+
+	patch_prog = bpf_prog_select_runtime(patch_prog, &err);
+	/*
+	 * Cleanup patch_prog in case of jit
+	 */
+	if (err < 0)
+		goto free_used_maps;
+	
+	prog->termination_states->patch_prog = patch_prog;
+	/*
+	 * Do a sanity check on jited prog and patch_prog
+	 * 1. Check jit length
+	 * 2. Check generated jit images
+	 */
+	pr_info("bpf_prog_load: After bpf_prog_select_runtime \n");
+
+	if (prog->aux->func_cnt == 0) {
+		pr_info("bpf_prog_load: prog->jited_len %d\n", prog->jited_len);
+		pr_info("bpf_prog_load: patch_prog->jited_len %d\n", patch_prog->jited_len);
+		if (!cmp_jit_data(prog) && prog->jited_len != patch_prog->jited_len)
+			goto free_used_maps;
+	} else {
+		pr_info("bpf_prog_load: subprog count %d\n", prog->aux->func_cnt);
+		for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+			pr_info("bpf_prog_load: prog[%d]->jited_len %d\n", subprog, 
+								prog->aux->func[subprog]->jited_len);
+			pr_info("bpf_prog_load: patch_prog[%d]->jited_len %d\n", subprog, 
+								patch_prog->aux->func[subprog]->jited_len);
+			if (prog->aux->func[subprog]->jited_len != patch_prog->aux->func[subprog]->jited_len)
+				goto free_used_maps;
+		}
+	}
+	
 
 	err = bpf_prog_alloc_id(prog);
 	if (err)
