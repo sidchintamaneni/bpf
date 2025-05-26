@@ -2782,13 +2782,10 @@ struct x64_jit_data {
 static int cmp_jit_data(struct bpf_prog *prog) {
 	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;	
 
-	pr_info("cmp_jit_data: prog->bpf_func 0x%p\n", prog->bpf_func);
-	pr_info("cmp_jit_data: patch_prog->bpf_func 0x%p\n", patch_prog->bpf_func);
-
-	print_hex_dump(KERN_INFO, "JIT code: prog", DUMP_PREFIX_ADDRESS,
+	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
 		16, 1, prog->bpf_func, prog->jited_len, false);
 
-	print_hex_dump(KERN_INFO, "JIT code: patch_prog", DUMP_PREFIX_ADDRESS,
+	print_hex_dump(KERN_INFO, "JIT code: patch_prog - ", DUMP_PREFIX_OFFSET,
 		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
 
 	return 0;

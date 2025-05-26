@@ -24062,10 +24062,11 @@ static int clone_patch_prog(struct bpf_verifier_env *env)
 	patch_prog->type = prog->type;
 	patch_prog->aux = aux;
 	/*
-	 * We copied stack depth because it is used in jit.
-	 * we may have to check and copy remaining feilds as well.
+	 * Copying these values because of mismatch/errors
+	 * while jiting patch_prog
 	 */
 	patch_prog->aux->stack_depth = prog->aux->stack_depth;
+	patch_prog->aux->num_exentries = prog->aux->num_exentries;
 
 	memcpy(patch_prog->insnsi, prog->insnsi, bpf_prog_insn_size(prog));
 
