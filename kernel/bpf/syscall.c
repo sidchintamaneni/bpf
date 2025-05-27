@@ -2757,30 +2757,10 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
-struct jit_context {
-	int cleanup_addr; /* Epilogue code offset */
-
-	/*
-	 * Program specific offsets of labels in the code; these rely on the
-	 * JIT doing at least 2 passes, recording the position on the first
-	 * pass, only to generate the correct offset on the second pass.
-	 */
-	int tail_call_direct_label;
-	int tail_call_indirect_label;
-};
-
-
-struct x64_jit_data {
-	struct bpf_binary_header *rw_header;
-	struct bpf_binary_header *header;
-	int *addrs;
-	u8 *image;
-	int proglen;
-	struct jit_context ctx;
-};
-
 static int cmp_jit_data(struct bpf_prog *prog) {
-	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;	
+	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;
+//	const u8 *prog_ptr = (void *)prog->bpf_func;
+//	const u8 *patch_prog_ptr = (void *)patch_prog->bpf_func;
 
 	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
 		16, 1, prog->bpf_func, prog->jited_len, false);
@@ -2789,6 +2769,12 @@ static int cmp_jit_data(struct bpf_prog *prog) {
 		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
 
 	return 0;
+}
+
+static void store_ip_offset_term_func(struct bpf_prog *prog)
+{
+	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;
+
 }
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
@@ -3031,7 +3017,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (prog->aux->func_cnt == 0) {
 		pr_info("bpf_prog_load: prog->jited_len %d\n", prog->jited_len);
 		pr_info("bpf_prog_load: patch_prog->jited_len %d\n", patch_prog->jited_len);
-		if (!cmp_jit_data(prog) && prog->jited_len != patch_prog->jited_len)
+		if (cmp_jit_data(prog) && prog->jited_len != patch_prog->jited_len)
 			goto free_used_maps;
 	} else {
 		pr_info("bpf_prog_load: subprog count %d\n", prog->aux->func_cnt);
@@ -3044,7 +3030,26 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 				goto free_used_maps;
 		}
 	}
-	
+
+
+	if (prog->termination_states->call_sites) {
+		prog->termination_states->offset = vmalloc(sizeof(int) * 
+						prog->termination_states->call_sites);
+		/*
+		 * Cleanup patch_prog in case of jit
+		 * LAZY way fn
+		 */
+		if (!termination_states->offset) {
+			err = -ENOMEM;
+			goto free_used_maps;
+		}
+		/*
+		 * store the offset to termination_call function
+		 * for runtime patching
+		 */
+		store_ip_offset_term_func(prog);
+	}
+
 
 	err = bpf_prog_alloc_id(prog);
 	if (err)
@@ -3065,6 +3070,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	 * be using bpf_prog_put() given the program is exposed.
 	 */
 	bpf_prog_kallsyms_add(prog);
+	bpf_prog_kallsyms_add(prog->termination_states->patch_prog);
 	perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_LOAD, 0);
 	bpf_audit_prog(prog, BPF_AUDIT_LOAD);
 

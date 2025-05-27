@@ -1528,6 +1528,7 @@ struct termination_aux_states {
 	struct bpf_prog *patch_prog;
 	int call_sites;
 	struct call_insn_aux *call_indices;
+	int *offset;
 };
 
 struct bpf_prog_aux {

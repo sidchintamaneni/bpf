@@ -24022,6 +24022,10 @@ static void patch_helper_kfunc(struct bpf_verifier_env *env)
 		patch_prog->insnsi[call_indices.insn_idx].imm = 
 			BPF_CALL_IMM(bpf_termination_null_func);
 	}
+
+	termination_states->offset = vmalloc(sizeof(int) * call_sites);
+	if (!call_indices)
+		return -ENOMEM;
 }
 
 static int clone_patch_prog(struct bpf_verifier_env *env)
