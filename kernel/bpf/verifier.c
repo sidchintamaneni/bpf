@@ -21061,6 +21061,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	if (env->subprog_cnt <= 1)
 		return 0;
 
+	pr_info("jit_subprogs: looping through instructions to update subprog id\n");
 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
 		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn))
 			continue;
@@ -21109,6 +21110,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	if (!func)
 		goto out_undo_insn;
 
+	pr_info("jit_subprogs: spliting the subprogs\n");
 	for (i = 0; i < env->subprog_cnt; i++) {
 		subprog_start = subprog_end;
 		subprog_end = env->subprog_info[i + 1].start;
@@ -21196,6 +21198,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	 * now populate all bpf_calls with correct addresses and
 	 * run last pass of JIT
 	 */
+	pr_info("jit_subprogs: Running last pass of jit\n");
 	for (i = 0; i < env->subprog_cnt; i++) {
 		insn = func[i]->insnsi;
 		for (j = 0; j < func[i]->len; j++, insn++) {
@@ -21241,12 +21244,14 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	 * populate kallsysm. Begin at the first subprogram, since
 	 * bpf_prog_load will add the kallsyms for the main program.
 	 */
+	pr_info("jit_subprogs: locking all functions\n");
 	for (i = 1; i < env->subprog_cnt; i++) {
 		err = bpf_prog_lock_ro(func[i]);
 		if (err)
 			goto out_free;
 	}
 
+	pr_info("jit_subprogs: generating kallsyms\n");
 	for (i = 1; i < env->subprog_cnt; i++)
 		bpf_prog_kallsyms_add(func[i]);
 
@@ -21335,6 +21340,8 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 				return -ENOMEM;
 			memcpy(patch_env, env, sizeof(*env));
 			patch_env->prog = patch_prog;
+			pr_info("fixup_call_args: env->subprogs_count %d\n", env->subprog_cnt);
+			pr_info("fixup_call_args: patch_env->subprogs count %d\n", patch_env->subprog_cnt);
 			err = jit_subprogs(patch_env);
 			kvfree(patch_env);
 			if (err == 0)
@@ -22605,6 +22612,7 @@ static struct bpf_prog *inline_bpf_loop(struct bpf_verifier_env *env,
 	call_insn_offset = position + 12;
 	callback_offset = callback_start - call_insn_offset - 1;
 	new_prog->insnsi[call_insn_offset].imm = callback_offset;
+	new_prog->insnsi[call_insn_offset].off = 0x1;
 
 	return new_prog;
 }
@@ -24009,23 +24017,50 @@ static void debug_bpf_prog(struct bpf_prog *prog)
 
 }
 
-static void patch_helper_kfunc(struct bpf_verifier_env *env)
+static int patch_helper_kfunc(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog;
 	struct termination_aux_states *termination_states = prog->termination_states;
 	struct bpf_prog *patch_prog = termination_states->patch_prog;
 	struct call_insn_aux call_indices;
 	int call_sites = termination_states->call_sites;
+	int i, subprog;
+	struct bpf_insn *insn;
 
+	pr_info("patch_helper_kfunc: patching helpers, kfuncs and loop callbacks\n");
 	for (int idx = 0; idx < call_sites; idx++) {
 		call_indices = termination_states->call_indices[idx];
 		patch_prog->insnsi[call_indices.insn_idx].imm = 
 			BPF_CALL_IMM(bpf_termination_null_func);
 	}
 
-	termination_states->offset = vmalloc(sizeof(int) * call_sites);
-	if (!call_indices)
-		return -ENOMEM;
+	if (!env->subprog_cnt)
+		return 0;	
+
+	for (i = 0, insn = patch_prog->insnsi; i < patch_prog->len; i++, insn++) {
+		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn))
+			continue;
+
+		subprog = find_subprog(env, i + insn->imm + 1);
+		if (subprog < 0) {
+			return -EFAULT;	
+		}
+
+		pr_info("patch_helper_kfunc: checking subporg offset 0x%04x\n", insn->off);
+		if (insn->off == 0x1) {
+			pr_info("patch_helper_kfunc: Updating loop callback with bpf_loop_termination\n");
+			patch_prog->insnsi[i].imm = BPF_CALL_IMM(bpf_loop_termination);
+			prog->insnsi[i].off = 0x0;
+			/*
+			 * Modify call to a helper call
+			 */
+			patch_prog->insnsi[i].off = 0x0;
+			patch_prog->insnsi[i].src_reg = 0x0;
+		}
+	}
+
+	return 0;
+
 }
 
 static int clone_patch_prog(struct bpf_verifier_env *env)
@@ -24067,10 +24102,55 @@ static int clone_patch_prog(struct bpf_verifier_env *env)
 	patch_prog->aux = aux;
 	/*
 	 * Copying these values because of mismatch/errors
-	 * while jiting patch_prog
+	 * while jiting patch_prog.
+	 *
+	 * So I am copying all the static feilds.
+	 * I am annotating the fields which are necessary for jiting.
+	 * NOTE: TODO: later remove the unused feilds
+	 * Insight: we can safely ignore the feilds used in runtime (BPF/ helper functions)
+	 *
+	 * Commenting this out because it is creating lots of null pointer
+	 * dereference issues.
 	 */
-	patch_prog->aux->stack_depth = prog->aux->stack_depth;
+	//patch_prog->aux->used_map_cnt = prog->aux->used_map_cnt;
+	//patch_prog->aux->used_btf_cnt = prog->aux->used_btf_cnt;
+	//patch_prog->aux->max_ctx_offset = prog->aux->max_ctx_offset;
+	patch_prog->aux->stack_depth = prog->aux->stack_depth; /* required for jit */
+	//patch_prog->aux->id = prog->aux->id; /* Allocated after bpf_prog_select_runtime */
+	//patch_prog->aux->func_cnt = prog->aux->func_cnt; /* will be populated by jit_subprogs */
+	//patch_prog->aux->real_func_cnt = prog->aux->real_func_cnt; /* will be populated by jit_subprogs */
+	//patch_prog->aux->func_idx = prog->aux->func_idx; /* will be populated by jit_subprogs */
+//	patch_prog->aux->attach_btf_id = prog->aux->attach_btf_id;
+//	patch_prog->aux->attach_st_ops_member_off = prog->aux->attach_st_ops_member_off;
+//	patch_prog->aux->ctx_arg_info_size = prog->aux->ctx_arg_info_size;
+//	patch_prog->aux->max_rdonly_access = prog->aux->max_rdonly_access;
+//	patch_prog->aux->max_rdwr_access = prog->aux->max_rdwr_access;
+//	patch_prog->aux->num_exentries = prog->aux->num_exentries; /* required for jit */
+//	patch_prog->aux->verifier_zext = prog->aux->verifier_zext;
+//	patch_prog->aux->dev_bound = prog->aux->dev_bound;
+//	patch_prog->aux->offload_requested = prog->aux->offload_requested;
+//	patch_prog->aux->attach_btf_trace = prog->aux->attach_btf_trace;
+//	patch_prog->aux->attach_tracing_prog = prog->aux->attach_tracing_prog;
+//	patch_prog->aux->func_proto_unreliable = prog->aux->func_proto_unreliable;
+//	patch_prog->aux->tail_call_reachable = prog->aux->tail_call_reachable;
+//	patch_prog->aux->xdp_has_frags = prog->aux->xdp_has_frags;
+//	patch_prog->aux->exception_cb = prog->aux->exception_cb;
+//	patch_prog->aux->exception_boundary = prog->aux->exception_boundary;
+//	patch_prog->aux->is_extended = prog->aux->is_extended;
+//	patch_prog->aux->jits_use_priv_stack = prog->aux->jits_use_priv_stack;
+//	patch_prog->aux->priv_stack_requested = prog->aux->priv_stack_requested;
+//	patch_prog->aux->changes_pkt_data = prog->aux->changes_pkt_data;
+//	patch_prog->aux->might_sleep = prog->aux->might_sleep;
+//	patch_prog->aux->prog_array_member_cnt = prog->aux->prog_array_member_cnt;
+//	patch_prog->aux->size_poke_tab = prog->aux->size_poke_tab;
+	/* Avoided copying load_time, verified_insns */
+//	patch_prog->aux->cgroup_atype = prog->aux->cgroup_atype;
+//	patch_prog->aux->func_info_cnt = prog->aux->func_info_cnt; /* resulting null ptr deref in core:630 */
+//	patch_prog->aux->nr_linfo = prog->aux->nr_linfo;
+//	patch_prog->aux->linfo_idx = prog->aux->linfo_idx;
 	patch_prog->aux->num_exentries = prog->aux->num_exentries;
+	/* I know it is a lot of mess but will remove most of them */
+
 
 	memcpy(patch_prog->insnsi, prog->insnsi, bpf_prog_insn_size(prog));
 
@@ -24287,6 +24367,10 @@ skip_full_check:
 	/* do 32-bit optimization after insn patching has done so those patched
 	 * insns could be handled correctly.
 	 */
+	/*
+	 * SPECIAL CASE
+	 * TODO: call sites data might be changed because of new instructions
+	 */ 
 	if (ret == 0 && !bpf_prog_is_offloaded(env->prog->aux)) {
 		ret = opt_subreg_zext_lo32_rnd_hi32(env, attr);
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
@@ -24316,7 +24400,7 @@ skip_full_check:
 	 * Patching kfuncs and helpers before jit
 	 */
 	if (ret == 0) 
-		patch_helper_kfunc(env);
+		ret = patch_helper_kfunc(env);
 
 	if (ret == 0)
 		ret = fixup_call_args(env);

@@ -2757,10 +2757,12 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
-static int cmp_jit_data(struct bpf_prog *prog) {
-	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;
-//	const u8 *prog_ptr = (void *)prog->bpf_func;
-//	const u8 *patch_prog_ptr = (void *)patch_prog->bpf_func;
+static int cmp_jit_data(struct bpf_prog *prog, struct bpf_prog *patch_prog) {
+	pr_info("cmp_jit_data: Comparing jit length\n");
+	if (prog->jited_len != patch_prog->jited_len)
+		return -EINVAL;
+
+	pr_info("cmp_jit_data: Dumping the data\n");
 
 	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
 		16, 1, prog->bpf_func, prog->jited_len, false);
@@ -2768,14 +2770,30 @@ static int cmp_jit_data(struct bpf_prog *prog) {
 	print_hex_dump(KERN_INFO, "JIT code: patch_prog - ", DUMP_PREFIX_OFFSET,
 		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
 
+//	unsigned char *prog_jit = (unsigned char*)prog->bpf_func;
+//	unsigned char *patch_prog_jit = (unsigned char*)patch_prog->bpf_func;
+
+	/*
+	 * Not sure if the comparison makesense because incase of mov instruction
+	 * from a address (which are usually relative) this comp will fail.
+	 *
+	 * Even skipping is not possible because this mov instruction size can't
+	 * be deterministic.
+	 */
+
+//	for(int i = 0; i < prog->jited_len; i++) {
+//		if (prog_jit[i] == 0xe8) {
+//			i += 4;
+//			continue;
+//		}
+//		if (prog_jit[i] != patch_prog_jit[i]) {
+//			return -EINVAL;	
+//		}
+//	}
+
 	return 0;
 }
 
-static void store_ip_offset_term_func(struct bpf_prog *prog)
-{
-	struct bpf_prog *patch_prog = prog->termination_states->patch_prog;
-
-}
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
@@ -3017,7 +3035,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (prog->aux->func_cnt == 0) {
 		pr_info("bpf_prog_load: prog->jited_len %d\n", prog->jited_len);
 		pr_info("bpf_prog_load: patch_prog->jited_len %d\n", patch_prog->jited_len);
-		if (cmp_jit_data(prog) && prog->jited_len != patch_prog->jited_len)
+		err = cmp_jit_data(prog, patch_prog);
+		if (err < 0)
 			goto free_used_maps;
 	} else {
 		pr_info("bpf_prog_load: subprog count %d\n", prog->aux->func_cnt);
@@ -3026,28 +3045,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 								prog->aux->func[subprog]->jited_len);
 			pr_info("bpf_prog_load: patch_prog[%d]->jited_len %d\n", subprog, 
 								patch_prog->aux->func[subprog]->jited_len);
-			if (prog->aux->func[subprog]->jited_len != patch_prog->aux->func[subprog]->jited_len)
+			
+			if (cmp_jit_data(prog->aux->func[subprog], patch_prog->aux->func[subprog]))
 				goto free_used_maps;
 		}
-	}
-
-
-	if (prog->termination_states->call_sites) {
-		prog->termination_states->offset = vmalloc(sizeof(int) * 
-						prog->termination_states->call_sites);
-		/*
-		 * Cleanup patch_prog in case of jit
-		 * LAZY way fn
-		 */
-		if (!termination_states->offset) {
-			err = -ENOMEM;
-			goto free_used_maps;
-		}
-		/*
-		 * store the offset to termination_call function
-		 * for runtime patching
-		 */
-		store_ip_offset_term_func(prog);
 	}
 
 
@@ -3070,7 +3071,6 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	 * be using bpf_prog_put() given the program is exposed.
 	 */
 	bpf_prog_kallsyms_add(prog);
-	bpf_prog_kallsyms_add(prog->termination_states->patch_prog);
 	perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_LOAD, 0);
 	bpf_audit_prog(prog, BPF_AUDIT_LOAD);
 

@@ -129,7 +129,6 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	fp->jit_requested = ebpf_jit_enabled();
 	fp->blinding_requested = bpf_jit_blinding_enabled(fp);
 	termination_states->call_sites = 0;
-	termination_states->patch_sites_cnt = 0;
 	fp->termination_states = termination_states;
 #ifdef CONFIG_CGROUP_BPF
 	aux->cgroup_atype = CGROUP_BPF_ATTACH_TYPE_INVALID;
@@ -1558,6 +1557,11 @@ noinline void *bpf_termination_null_func(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
 }
 EXPORT_SYMBOL_GPL(bpf_termination_null_func);
 
+noinline int bpf_loop_termination(u64 reg_loop_cnt, u64 *reg_loop_ctx)
+{
+	return 1;
+}
+EXPORT_SYMBOL_GPL(bpf_loop_termination);
 /* Base function for offset calculation. Needs to go into .text section,
  * therefore keeping it non-static as well; will also be used by JITs
  * anyway later on, so do not let the compiler omit it. This also needs
