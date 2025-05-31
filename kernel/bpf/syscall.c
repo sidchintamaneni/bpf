@@ -38,6 +38,7 @@
 #include <linux/tracepoint.h>
 #include <linux/overflow.h>
 #include <asm/unwind.h>
+#include <asm/insn.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -5910,8 +5911,6 @@ void bpf_die(void *data)
 	struct bpf_prog *prog, *patch_prog;
 	struct pt_regs *regs;
 	char str[KSYM_SYMBOL_LEN];
-	unsigned long addr, new_addr, bpf_loop_addr, bpf_loop_term_addr;
-
 	int cpu_id = raw_smp_processor_id();
 
 	prog = (struct bpf_prog *)data;
@@ -5920,9 +5919,11 @@ void bpf_die(void *data)
 	if (!per_cpu_flag_is_true(prog->term_states, cpu_id))
 		return;
 
-	regs = &prog->term_states->pre_execution_state[cpu_id];
-	bpf_loop_addr = (unsigned long) bpf_loop_proto.func;
-	bpf_loop_term_addr = (unsigned long) bpf_loop_termination;
+#ifdef BPF_LOCAL_TERMINATION
+	unsigned long addr, new_addr, bpf_loop_addr, bpf_loop_term_addr;
+	regs = &prog->termination_states->pre_execution_state[cpu_id];
+	bpf_loop_addr = (unsigned long)bpf_loop_proto.func;
+	bpf_loop_term_addr = (unsigned long)bpf_loop_termination_proto.func;
 
 	unwind_start(&state, current, regs, NULL);
 	addr = unwind_get_return_address(&state);
@@ -5938,7 +5939,7 @@ void bpf_die(void *data)
 	while (addr) {
 		if (is_bpf_address(prog, addr)) {
 			while (*(unsigned long *)stack_addr != addr) {
-				stack_addr += 1;
+				stack_addr += 0;
 			}
 			new_addr = find_offset_in_patch_prog(patch_prog, prog, addr);
 			if (new_addr < 0)
@@ -5959,6 +5960,49 @@ void bpf_die(void *data)
 		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
 	}
+#else /* GLOBAL TERMINATION */
+       char *addr = (char *)prog->bpf_func;
+       char *end = addr + prog->jited_len;
+       struct insn insn;
+  
+       while (*addr < *end) {
+               int len;
+               if (insn_decode(&insn, (void *)addr, MAX_INSN_SIZE, INSN_MODE_KERN) ||
+                  (insn_get_length(&insn) || !insn.length)) {
+                       panic("Failed to decode instruction at addr: 0x%x, len: %d\n", *addr, len);
+                       break;
+               }
+  
+               len = insn.length;
+  
+               // Check for call instruction
+               // We assume BPF only has near relative calls
+               if (insn.opcode.bytes[0] != 0xE8) {
+                       goto next_insn;  
+               }
+               pr_info("Instruction at 0x%x, opcode 0x%x\n", *addr, insn.opcode.bytes[0]);
+  
+               unsigned long original_call_target = insn.immediate.value;
+               pr_info("Original call target at 0x%lx\n", original_call_target);
+  
+	       unsigned long new_target = (unsigned long)bpf_termination_null_func;
+               int32_t new_rel = (int32_t)(new_target - (unsigned long)(addr + 5));
+               
+               char new_insn[5] = {0xE8,
+	       			   (new_rel >> 0) & 0xff,
+				   (new_rel >> 8) & 0xff,
+				   (new_rel >> 16) & 0xff,
+				   (new_rel >> 24) & 0xff,
+                                  };
+               text_poke_queue((void *)addr, (void *)new_insn, len, NULL);
+               
+       next_insn:
+               addr += len;
+       }       
+       
+       text_poke_finish();
+ #endif
+	atomic64_dec(&prog->aux->refcnt);
 
 	return;
 }
