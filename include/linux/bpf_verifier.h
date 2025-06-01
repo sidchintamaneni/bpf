@@ -718,6 +718,11 @@ struct bpf_idset {
 	u32 ids[BPF_ID_MAP_SIZE];
 };
 
+struct bpf_term_patch_call_sites {
+	u32 call_sites_cnt;
+	int *call_idx;
+};
+
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
@@ -816,6 +821,10 @@ struct bpf_verifier_env {
 	char tmp_str_buf[TMP_STR_BUF_LEN];
 	struct bpf_insn insn_buf[INSN_BUF_SIZE];
 	struct bpf_insn epilogue_buf[INSN_BUF_SIZE];
+	struct {
+		u32 call_sites_cnt;
+		int *call_idx;
+	} bpf_term_patch_call_sites;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)

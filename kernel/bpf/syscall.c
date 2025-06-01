@@ -2757,6 +2757,36 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
+static int sanity_check_jit_len(struct bpf_prog *prog)
+{
+	char prog_prefix[] = "bpf_prog";
+	char patch_prog_prefix[] = "patch_bpf_prog";
+	struct bpf_prog *patch_prog = prog->term_states->patch_prog;
+	if (!strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
+		if(!strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
+	      	pr_info("sanity_check_jit_len: prog->jited_len %d\n", prog->jited_len);
+	      	pr_info("sanity_check_jit_len: patch_prog->jited_len %d\n", patch_prog->jited_len);
+		}
+	}
+
+	if (prog->jited_len != patch_prog->jited_len)
+		return -EFAULT;
+
+	if (!strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
+		if(!strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
+	      	pr_info("sanity_check_jit_len: Dumping the jit data for debugging\n");
+	      	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
+	      		16, 1, prog->bpf_func, prog->jited_len, false);
+
+	      	print_hex_dump(KERN_INFO, "JIT code: patch_prog - ", DUMP_PREFIX_OFFSET,
+	      		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
+		}
+	}
+
+	return 0;
+
+}
+
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
 	enum bpf_prog_type type = attr->prog_type;
@@ -2974,6 +3004,18 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 		goto free_used_maps;
 
 	prog = bpf_prog_select_runtime(prog, &err);
+	if (err < 0)
+		goto free_used_maps;
+
+	/*
+	 * TODO: I beleive the current resource cleanup for patch prog
+	 * is not complete!
+	 */
+	prog->term_states->patch_prog = bpf_prog_select_runtime(prog->term_states->patch_prog, &err);
+	if (err < 0)
+		goto free_used_maps;
+
+	err = sanity_check_jit_len(prog);
 	if (err < 0)
 		goto free_used_maps;
 

@@ -39,6 +39,7 @@ struct bpf_prog;
 struct bpf_prog_aux;
 struct bpf_map;
 struct bpf_arena;
+struct bpf_term_aux_states;
 struct sock;
 struct seq_file;
 struct btf;
@@ -1538,6 +1539,10 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct bpf_term_aux_states {
+	struct bpf_prog *patch_prog;
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1676,6 +1681,7 @@ struct bpf_prog {
 					    const struct bpf_insn *insn);
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+	struct bpf_term_aux_states *term_states; /* Program termination aux fields */
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
