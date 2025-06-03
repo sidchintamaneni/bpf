@@ -2765,8 +2765,8 @@ static int sanity_check_jit_len(struct bpf_prog *prog)
 	struct bpf_prog *patch_prog = prog->term_states->patch_prog;
 	if (!strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
 		if(!strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
-	      	pr_info("sanity_check_jit_len: prog->jited_len %d\n", prog->jited_len);
-	      	pr_info("sanity_check_jit_len: patch_prog->jited_len %d\n", patch_prog->jited_len);
+			pr_info("sanity_check_jit_len: prog->jited_len %d\n", prog->jited_len);
+	      		pr_info("sanity_check_jit_len: patch_prog->jited_len %d\n", patch_prog->jited_len);
 		}
 	}
 

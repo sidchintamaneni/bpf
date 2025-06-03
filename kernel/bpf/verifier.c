@@ -23974,10 +23974,10 @@ static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 	 */
 	char prog_prefix[] = "bpf_prog";
 	char patch_prog_prefix[] = "patch_bpf_prog";
-//	if (strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
-//		if(strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix)))
-//			return;
-//	}
+	if (strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
+		if(strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix)))
+			return;
+	}
 	pr_info("********************************************************************");
 	pr_info("%s\n", str);
 	pr_info("********************************************************************");
