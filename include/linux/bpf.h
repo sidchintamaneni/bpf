@@ -1539,8 +1539,16 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct cpu_aux {
+	u8 cpu_flag;
+	spinlock_t lock;
+};
+
 struct bpf_term_aux_states {
 	struct bpf_prog *patch_prog;
+	struct cpu_aux *per_cpu_state;
+	struct pt_regs *pre_execution_state;
+	bool is_termination_prog;
 };
 
 struct bpf_prog_aux {

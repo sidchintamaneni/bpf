@@ -125,6 +125,21 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	if (!term_states)
 		goto free_alloc_percpu;
 
+	term_states->per_cpu_state = kzalloc(sizeof(struct cpu_aux) * NR_CPUS, bpf_memcg_flags(GFP_KERNEL | 
+										gfp_extra_flags));
+	if (!term_states->per_cpu_state)
+		goto free_bpf_term_states;
+
+	for (int i = 0; i < NR_CPUS; i++) {
+		term_states->per_cpu_state[i].cpu_flag = 0;
+		spin_lock_init(&term_states->per_cpu_state[i].lock);
+	}
+
+	term_states->pre_execution_state = kzalloc(sizeof(struct pt_regs) * NR_CPUS,
+						bpf_memcg_flags(GFP_KERNEL |  gfp_extra_flags));
+	if (!term_states->pre_execution_state)
+		goto free_per_cpu_state;
+
 	fp->pages = size / PAGE_SIZE;
 	fp->aux = aux;
 	fp->aux->prog = fp;
@@ -146,6 +161,10 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 
 	return fp;
 
+free_per_cpu_state:
+	kfree(term_states->per_cpu_state);
+free_bpf_term_states:
+	kfree(term_states);
 free_alloc_percpu:
 	free_percpu(fp->active);
 	kfree(aux);
@@ -304,6 +323,8 @@ void __bpf_prog_free(struct bpf_prog *fp)
 			kfree(fp->term_states->patch_prog->aux);
 			vfree(fp->term_states->patch_prog);
 		}
+		kfree(fp->term_states->pre_execution_state);
+		kfree(fp->term_states->per_cpu_state);
 		kfree(fp->term_states);
 	}
 	free_percpu(fp->stats);
