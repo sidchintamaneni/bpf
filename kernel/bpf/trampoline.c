@@ -908,6 +908,7 @@ static u64 notrace __bpf_prog_enter_recur(struct bpf_prog *prog, struct bpf_tram
 			prog->aux->recursion_detected(prog);
 		return 0;
 	}
+	update_term_per_cpu_flag(prog, 1);
 	return bpf_prog_start_time();
 }
 
@@ -941,6 +942,7 @@ static void notrace __bpf_prog_exit_recur(struct bpf_prog *prog, u64 start,
 	bpf_reset_run_ctx(run_ctx->saved_run_ctx);
 
 	update_prog_stats(prog, start);
+	update_term_per_cpu_flag(prog, 0);
 	this_cpu_dec(*(prog->active));
 	migrate_enable();
 	rcu_read_unlock();
@@ -1058,7 +1060,7 @@ void notrace __bpf_tramp_exit(struct bpf_tramp_image *tr)
 bpf_trampoline_enter_t bpf_trampoline_enter(const struct bpf_prog *prog)
 {
 	bool sleepable = prog->sleepable;
-
+	
 	if (bpf_prog_check_recur(prog))
 		return sleepable ? __bpf_prog_enter_sleepable_recur :
 			__bpf_prog_enter_recur;
