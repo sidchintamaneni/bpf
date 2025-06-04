@@ -21567,6 +21567,13 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 	return 0;
 }
 
+static bool is_bpf_loop_call(struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+		insn->src_reg == 0 &&
+		insn->imm == BPF_FUNC_loop;
+}
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -22428,7 +22435,7 @@ patch_call_imm:
 			return -EFAULT;
 		}
 
-		if (fn->ret_type & PTR_MAYBE_NULL) {
+		if ((fn->ret_type & PTR_MAYBE_NULL) ||  is_bpf_loop_call(insn)) {
 			call_idx[call_sites_cnt] = i + delta;
 			call_sites_cnt++;
 		}
@@ -22594,13 +22601,6 @@ static struct bpf_prog *inline_bpf_loop(struct bpf_verifier_env *env,
 	new_prog->insnsi[call_insn_offset].off = 0x1;
 
 	return new_prog;
-}
-
-static bool is_bpf_loop_call(struct bpf_insn *insn)
-{
-	return insn->code == (BPF_JMP | BPF_CALL) &&
-		insn->src_reg == 0 &&
-		insn->imm == BPF_FUNC_loop;
 }
 
 /* For all sub-programs in the program (including main) check
@@ -24094,7 +24094,7 @@ static int patch_call_sites(struct bpf_verifier_env *env)
 			return -EFAULT;
 
 		if (insn->off == 0x1) {
-			patch_prog->insnsi[i].imm = BPF_CALL_IMM(bpf_loop_termination);
+			patch_prog->insnsi[i].imm = BPF_CALL_IMM(bpf_loop_term_callback);
 			prog->insnsi[i].off = 0x0; /* Removing the marker */
 			/*
 			 * Modify callback call -> function call
