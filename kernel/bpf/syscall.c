@@ -2952,6 +2952,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 
 	prog->orig_prog = NULL;
 	prog->jited = 0;
+	prog->is_termination_prog = 0;
 
 	atomic64_set(&prog->aux->refcnt, 1);
 

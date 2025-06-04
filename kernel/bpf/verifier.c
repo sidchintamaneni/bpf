@@ -21128,6 +21128,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 			goto out_free;
 		func[i]->is_func = 1;
 		func[i]->sleepable = prog->sleepable;
+		if (prog->is_termination_prog)
+			func[i]->is_termination_prog = 1;
 		func[i]->aux->func_idx = i;
 		/* Below members will be freed only at prog->aux */
 		func[i]->aux->btf = prog->aux->btf;
@@ -21244,9 +21246,11 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		if (err)
 			goto out_free;
 	}
-
-	for (i = 1; i < env->subprog_cnt; i++)
-		bpf_prog_kallsyms_add(func[i]);
+	
+	if (!prog->is_termination_prog) {
+		for (i = 1; i < env->subprog_cnt; i++)
+			bpf_prog_kallsyms_add(func[i]);
+	}
 
 	/* Last step: make now unused interpreter insns from main
 	 * prog consistent for later dump requests, so they can
@@ -24038,6 +24042,7 @@ static int clone_patch_prog(struct bpf_verifier_env *env)
 	patch_prog->jit_requested = prog->jit_requested;
 	patch_prog->gpl_compatible = prog->gpl_compatible;
 	patch_prog->blinding_requested = prog->blinding_requested;
+	patch_prog->is_termination_prog = 1;
 	/*
 	 * TODO: Do we have to populate remaining fields
 	 * in bpf_prog struct?
