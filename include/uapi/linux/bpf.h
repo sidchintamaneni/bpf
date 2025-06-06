@@ -906,6 +906,13 @@ union bpf_iter_link_info {
  *		A new file descriptor (a nonnegative integer), or -1 if an
  *		error occurred (in which case, *errno* is set appropriately).
  *
+ * BPF_PROG_TERMINATE
+ *	Description
+ *		Nothing.
+ *
+ *	Return
+ *		Nothing.
+ *
  * NOTES
  *	eBPF objects (maps and programs) can be shared between processes.
  *
