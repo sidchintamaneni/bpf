@@ -85,6 +85,11 @@ struct {
 } percpu_map SEC(".maps");
 
 /* Basic protocol counter (sockex1) */
+/* Comments:
+ * Why not have same program as the sample programs?
+ * I beleive it would be easier to convince them if it is
+ * same sample program.
+ */
 SEC("socket1")
 int bpf_prog1(struct __sk_buff *skb)
 {
@@ -111,6 +116,10 @@ int bpf_prog1(struct __sk_buff *skb)
 }
 
 /* Flow tracker (sockex2) */
+/* Comments:
+ * Why not have same program as the sample programs?
+ * same comment as above
+ */
 SEC("socket2")
 int bpf_prog2(struct __sk_buff *skb)
 {

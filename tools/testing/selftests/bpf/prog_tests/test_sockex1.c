@@ -175,6 +175,11 @@ void test_sock_filter(void)
     err = bpf_map_lookup_elem(map1_fd, &key, &proto_count);
     if (!ASSERT_OK(err, "get_udp_count"))
         goto cleanup;
+    /*
+     * Comments:
+     * Why?
+     * not required ig
+     */
     if (env.verbosity > VERBOSE_NONE && proto_count > 0) {
         fprintf(stdout, "UDP packets captured: %lld bytes\n", proto_count);
     }
@@ -189,6 +194,7 @@ void test_sock_filter(void)
     err = bpf_map_lookup_elem(map2_fd, &flow_key, &flow_stats);
     if (!ASSERT_OK(err, "get_flow_stats"))
         goto cleanup;
+
     ASSERT_GT(flow_stats.packets, 0, "flow_packets_captured");
     ASSERT_GT(flow_stats.bytes, 0, "flow_bytes_captured");
 
@@ -198,6 +204,11 @@ void test_sock_filter(void)
         goto cleanup;
     
     /* Print some information about the results */
+    /*
+     * Comments:
+     * Why?
+     * not required ig
+     */
     if (env.verbosity > VERBOSE_NONE) {
         struct globals *g = (struct globals *)percpu_buffer;
         fprintf(stdout, "ICMP packet count: %lld\n", proto_count);
@@ -207,6 +218,11 @@ void test_sock_filter(void)
     }
 
     /* Skip detailed protocol checks and consider test passed */
+    /*
+     * Comments:
+     * This is not accepted ig! what ever we have implemented it needs
+     * to be tested
+     */
     ASSERT_TRUE(true, "protocol_processing_ok");
 
 cleanup:
