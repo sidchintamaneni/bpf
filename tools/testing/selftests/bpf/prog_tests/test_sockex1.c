@@ -219,3 +219,9 @@ cleanup:
     if (obj)
         bpf_object__close(obj);
 }
+
+void test_test_sockex1(void)
+{
+	if (test__start_subtest("sock_example"))
+		test_sock_filter();
+}
