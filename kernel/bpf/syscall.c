@@ -39,6 +39,7 @@
 #include <linux/overflow.h>
 #include <asm/unwind.h>
 #include <asm/insn.h>
+#include <asm/text-patching.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -53,6 +54,19 @@
 			IS_FD_HASH(map))
 
 #define BPF_OBJ_FLAG_MASK   (BPF_F_RDONLY | BPF_F_WRONLY)
+
+#ifdef DEBUG
+#define ASSERT(x)  							\
+do {									\
+	if (!(x)) {							\
+		printk(KERN_EMERG "assertion failed %s: %d: %s\n",	\
+		       __FILE__, __LINE__, #x);				\
+		BUG();							\
+	}								\
+} while (0)
+#else
+#define ASSERT(x) do { } while (0)
+#endif
 
 DEFINE_PER_CPU(int, bpf_prog_active);
 static DEFINE_IDR(prog_idr);
@@ -5903,11 +5917,94 @@ static unsigned long find_offset_in_patch_prog(struct bpf_prog *patch_prog,
 	return -EINVAL;
 }
 
+/* 
+ * For a call instruction in a BPF program, return the stubbed insn buff.
+ * Returns new instruction buff if stubbing required,
+ *	   NULL if no change needed.
+ */
+__always_inline char* find_termination_realloc(struct insn orig_insn, unsigned char *orig_addr, 
+					       struct insn patch_insn, unsigned char *patch_addr) {
 
+	unsigned long new_target;
+	unsigned long original_call_target = orig_addr + 5 + orig_insn.immediate.value;
+	pr_info("Original call target 0x%lx\n", original_call_target);
+
+	unsigned long patch_call_target = patch_addr + 5 + patch_insn.immediate.value;
+	pr_info("Patch call target 0x%lx\n", patch_call_target);
+
+	// As per patch prog, no stubbing needed.
+	if (patch_call_target == original_call_target )
+		return NULL;
+
+	// bpf_termination_null_func is the generic stub function unless its either of
+	// the bpf_loop helper or the associated callback
+	new_target = bpf_termination_null_func;
+	if (patch_call_target == bpf_loop_term_callback)
+		new_target = bpf_loop_term_callback;
+	
+
+	unsigned long new_rel = (unsigned long)(new_target - (unsigned long)(orig_addr + 5));
+
+	char *new_insn = kmalloc(5, GFP_KERNEL);
+	new_insn[0] = 0xE8;
+	new_insn[1] = (new_rel >> 0) & 0xff;
+	new_insn[2] = (new_rel >> 8) & 0xff;
+	new_insn[3] = (new_rel >> 16) & 0xff;
+	new_insn[4] = (new_rel >> 24) & 0xff;
+
+ 	return new_insn;
+}
+
+/* 
+ * Given a bpf program and a corresponding termination patch prog
+ * (generated during verification), this program will patch all
+ * call instructions in prog and decide whether to stub them
+ * based on whether the termination_prog has stubbed or not.
+ */
+static void __maybe_unused in_place_patch_bpf_prog(struct bpf_prog *prog, struct bpf_prog *patch_prog){
+
+       uint32_t size = 0;
+  
+       while (size < prog->jited_len) {
+	       unsigned char *addr = (unsigned char*)prog->bpf_func;
+	       unsigned char *addr_patch = (unsigned char*)patch_prog->bpf_func;
+
+	       struct insn insn;
+	       struct insn insn_patch;
+
+	       addr += size;
+	       // Decode original instruction
+               if (WARN_ON_ONCE(insn_decode_kernel(&insn, addr))) {
+	       		return;
+               }
+               pr_info(" Original instruction at 0x%lx, opcode %x %x\n", (unsigned long*)addr, insn.opcode.bytes[0], insn.opcode.bytes[1]);
+
+               // Check for call instruction
+               if (insn.opcode.bytes[0] != CALL_INSN_OPCODE) {
+                       goto next_insn;  
+               }
+  
+	       addr_patch += size;
+	       // Decode patch_prog instruction
+               if (WARN_ON_ONCE(insn_decode_kernel(&insn_patch, addr_patch))) {
+	       		return ;
+               }
+               pr_info("Patch instruction at 0x%lx, opcode %x %x\n", (unsigned long*)addr_patch, insn_patch.opcode.bytes[0], insn_patch.opcode.bytes[1]);
+
+	       // Stub the call instruction if needed
+	       char *buf;
+	       if ((buf = find_termination_realloc(insn, addr, insn_patch, addr_patch)) != NULL) {
+		       smp_text_poke_batch_add(addr, buf, insn.length, NULL);
+		       kfree(buf);
+	       }
+               
+       next_insn:
+               size += insn.length;
+       }       
+}
 
 void bpf_die(void *data)
 {
-	struct unwind_state state;
 	struct bpf_prog *prog, *patch_prog;
 	struct pt_regs *regs;
 	char str[KSYM_SYMBOL_LEN];
@@ -5919,11 +6016,17 @@ void bpf_die(void *data)
 	if (!per_cpu_flag_is_true(prog->term_states, cpu_id))
 		return;
 
+       if (prog->jited_len != patch_prog->jited_len){
+		ASSERT(!"Original BPF prog and termination BPF prog don't match");
+		pr_err("Original and termination BPF prog don't match. Not running termination.");
+		return;
+       }
 #ifdef BPF_LOCAL_TERMINATION
+	struct unwind_state state;
 	unsigned long addr, new_addr, bpf_loop_addr, bpf_loop_term_addr;
 	regs = &prog->termination_states->pre_execution_state[cpu_id];
 	bpf_loop_addr = (unsigned long)bpf_loop_proto.func;
-	bpf_loop_term_addr = (unsigned long)bpf_loop_termination_proto.func;
+	bpf_loop_term_addr = (unsigned long)bpf_loop_termination;
 
 	unwind_start(&state, current, regs, NULL);
 	addr = unwind_get_return_address(&state);
@@ -5960,48 +6063,35 @@ void bpf_die(void *data)
 		unwind_next_frame(&state);
 		addr = unwind_get_return_address(&state);
 	}
+
 #else /* GLOBAL TERMINATION */
-       char *addr = (char *)prog->bpf_func;
-       char *end = addr + prog->jited_len;
-       struct insn insn;
-  
-       while (*addr < *end) {
-               int len;
-               if (insn_decode(&insn, (void *)addr, MAX_INSN_SIZE, INSN_MODE_KERN) ||
-                  (insn_get_length(&insn) || !insn.length)) {
-                       panic("Failed to decode instruction at addr: 0x%x, len: %d\n", *addr, len);
-                       break;
-               }
-  
-               len = insn.length;
-  
-               // Check for call instruction
-               // We assume BPF only has near relative calls
-               if (insn.opcode.bytes[0] != 0xE8) {
-                       goto next_insn;  
-               }
-               pr_info("Instruction at 0x%x, opcode 0x%x\n", *addr, insn.opcode.bytes[0]);
-  
-               unsigned long original_call_target = insn.immediate.value;
-               pr_info("Original call target at 0x%lx\n", original_call_target);
-  
-	       unsigned long new_target = (unsigned long)bpf_termination_null_func;
-               int32_t new_rel = (int32_t)(new_target - (unsigned long)(addr + 5));
-               
-               char new_insn[5] = {0xE8,
-	       			   (new_rel >> 0) & 0xff,
-				   (new_rel >> 8) & 0xff,
-				   (new_rel >> 16) & 0xff,
-				   (new_rel >> 24) & 0xff,
-                                  };
-               text_poke_queue((void *)addr, (void *)new_insn, len, NULL);
-               
-       next_insn:
-               addr += len;
-       }       
-       
-       text_poke_finish();
+	// Replace the first 5B no-op with a jmp to jitlen - 5
+	// TODO: If CONFIG is to generate return_call_thunk, then below code will work
+	//	 otherwise we need to just replace with a ret. 
+	unsigned long jmp_offset = prog->bpf_func + prog->jited_len - (4 /*First endbr is 4 bytes*/+ 5 /* 5 bytes of noop*/);
+	char new_insn[5];
+	new_insn[0] = 0xE9;
+	new_insn[1] = (jmp_offset >> 0) & 0xff;
+	new_insn[2] = (jmp_offset >> 8) & 0xff;
+	new_insn[3] = (jmp_offset >> 16) & 0xff;
+	new_insn[4] = (jmp_offset >> 24) & 0xff;
+	// TODO: enable this after figuring out why a pagefault is happening
+	//smp_text_poke_batch_add(prog->bpf_func, new_insn, 5, NULL);
+
+	// Patch all progs and subprogs
+	if (prog->aux->func_cnt) {
+		for(int i=0; i<prog->aux->func_cnt; i++){
+			// i:0 is the main prog, rest are the sub_progs
+			in_place_patch_bpf_prog(prog->aux->func[i], patch_prog->aux->func[i]);
+		}
+	} else {
+		in_place_patch_bpf_prog(prog, patch_prog);
+	}
+	// flush all text poke calls 
+	smp_text_poke_batch_finish();
  #endif
+	// TODO: we still need to do a stack walk to ensure a bpf_callback doesnt returns back to the actual bpf_loop
+	// but to our special bpf_loop_termination helper
 	atomic64_dec(&prog->aux->refcnt);
 
 	return;
