@@ -6065,10 +6065,10 @@ void bpf_die(void *data)
 	}
 
 #else /* GLOBAL TERMINATION */
-	// Replace the first 5B no-op with a jmp to jitlen - 5
+	// Replace the 5B no-op with a jmp to `jmp return_thunk` located at the end of bpf_func
 	// TODO: If CONFIG is to generate return_call_thunk, then below code will work
 	//	 otherwise we need to just replace with a ret. 
-	unsigned long jmp_offset = prog->bpf_func + prog->jited_len - (4 /*First endbr is 4 bytes*/+ 5 /* 5 bytes of noop*/);
+	unsigned long jmp_offset = prog->jited_len - (4 /*First endbr is 4 bytes*/+ 5 /*5 bytes of noop*/ + 5 /*5 bytes of jmp return_thunk*/);
 	char new_insn[5];
 	new_insn[0] = 0xE9;
 	new_insn[1] = (jmp_offset >> 0) & 0xff;
@@ -6076,7 +6076,7 @@ void bpf_die(void *data)
 	new_insn[3] = (jmp_offset >> 16) & 0xff;
 	new_insn[4] = (jmp_offset >> 24) & 0xff;
 	// TODO: enable this after figuring out why a pagefault is happening
-	//smp_text_poke_batch_add(prog->bpf_func + 4, new_insn, 5, NULL);
+	smp_text_poke_batch_add(prog->bpf_func + 4, new_insn, 5, NULL);
 
 	// Patch all progs and subprogs
 	if (prog->aux->func_cnt) {
