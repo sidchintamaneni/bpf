@@ -30,6 +30,8 @@
 #include <linux/static_call.h>
 #include <linux/memcontrol.h>
 #include <linux/cfi.h>
+#include <linux/hrtimer.h>    // struct hrtimer, hrtimer_init, hrtimer_start, hrtimer_cancel
+#include <linux/ktime.h>
 #include <asm/rqspinlock.h>
 
 struct bpf_verifier_env;
@@ -1315,6 +1317,7 @@ struct bpf_dispatcher {
 #define __bpfcall __nocfi
 #endif
 
+
 static __always_inline __bpfcall unsigned int bpf_dispatcher_nop_func(
 	const void *ctx,
 	const struct bpf_insn *insnsi,
@@ -1691,6 +1694,7 @@ struct bpf_prog {
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
 	struct bpf_term_aux_states *term_states; /* Program termination aux fields */
+	struct hrtimer		hrtimer;
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
@@ -2397,6 +2401,7 @@ static inline struct btf *__btf_get_by_fd(struct fd f)
 	return fd_file(f)->private_data;
 }
 
+enum hrtimer_restart bpf_termination_wd_callback(struct hrtimer *hr);
 void bpf_map_inc(struct bpf_map *map);
 void bpf_map_inc_with_uref(struct bpf_map *map);
 struct bpf_map *__bpf_map_inc_not_zero(struct bpf_map *map, bool uref);

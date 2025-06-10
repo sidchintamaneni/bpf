@@ -708,6 +708,20 @@ static void update_term_per_cpu_flag(const struct bpf_prog *prog, u8 cpu_flag)
 				flags);
 }
 
+static void bpf_terminate_timer_init(struct bpf_prog *prog){
+	ktime_t timeout = ktime_set(1, 0); // 1s, 0ns
+
+	/* Initialize timer on Monotonic clock, relative mode */
+	hrtimer_setup(&prog->hrtimer, bpf_termination_wd_callback, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+
+	/* Start watchdog */
+	hrtimer_start(&prog->hrtimer, timeout, HRTIMER_MODE_REL);
+}
+
+static void bpf_terminate_timer_cancel(struct bpf_prog *prog){
+	hrtimer_cancel(&prog->hrtimer);  
+}
+
 static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 					  const void *ctx,
 					  bpf_dispatcher_fn dfunc)
@@ -721,7 +735,9 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 		unsigned long flags;
 
 		update_term_per_cpu_flag(prog, 1);
+		bpf_terminate_timer_init(prog);
 		ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
+		bpf_terminate_timer_cancel(prog);
 		update_term_per_cpu_flag(prog, 0);
 
 		duration = sched_clock() - start;
@@ -732,7 +748,9 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
 		u64_stats_update_end_irqrestore(&stats->syncp, flags);
 	} else {
 		update_term_per_cpu_flag(prog, 1);
+		bpf_terminate_timer_init(prog);
 		ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
+		bpf_terminate_timer_cancel(prog);
 		update_term_per_cpu_flag(prog, 0);
 	}
 	return ret;

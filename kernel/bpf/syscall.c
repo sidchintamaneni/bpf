@@ -6076,7 +6076,7 @@ void bpf_die(void *data)
 	new_insn[3] = (jmp_offset >> 16) & 0xff;
 	new_insn[4] = (jmp_offset >> 24) & 0xff;
 	// TODO: enable this after figuring out why a pagefault is happening
-	//smp_text_poke_batch_add(prog->bpf_func, new_insn, 5, NULL);
+	//smp_text_poke_batch_add(prog->bpf_func + 4, new_insn, 5, NULL);
 
 	// Patch all progs and subprogs
 	if (prog->aux->func_cnt) {
@@ -6096,6 +6096,15 @@ void bpf_die(void *data)
 
 	return;
 }
+
+enum hrtimer_restart bpf_termination_wd_callback(struct hrtimer *hr){
+	pr_info("Starting bpf termination watchdog callback..");
+	struct bpf_prog *prog = container_of(hr, struct bpf_prog, hrtimer);
+	bpf_die(prog);
+	pr_info("Finished bpf termination watchdog callback!");
+	return HRTIMER_NORESTART;
+}
+EXPORT_SYMBOL_GPL(bpf_termination_wd_callback);
 
 static int bpf_prog_terminate(union bpf_attr *attr)
 {
