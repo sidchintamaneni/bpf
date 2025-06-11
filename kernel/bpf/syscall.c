@@ -40,6 +40,7 @@
 #include <asm/unwind.h>
 #include <asm/insn.h>
 #include <asm/text-patching.h>
+#include <asm/irq_regs.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -6006,7 +6007,7 @@ static void __maybe_unused in_place_patch_bpf_prog(struct bpf_prog *prog, struct
 void bpf_die(void *data)
 {
 	struct bpf_prog *prog, *patch_prog;
-	struct pt_regs *regs;
+	struct pt_regs *regs = get_irq_regs();
 	char str[KSYM_SYMBOL_LEN];
 	int cpu_id = raw_smp_processor_id();
 
@@ -6042,7 +6043,7 @@ void bpf_die(void *data)
 	while (addr) {
 		if (is_bpf_address(prog, addr)) {
 			while (*(unsigned long *)stack_addr != addr) {
-				stack_addr += 0;
+				stack_addr += 1;
 			}
 			new_addr = find_offset_in_patch_prog(patch_prog, prog, addr);
 			if (new_addr < 0)
@@ -6089,6 +6090,34 @@ void bpf_die(void *data)
 	}
 	// flush all text poke calls 
 	smp_text_poke_batch_finish();
+
+	struct unwind_state state;
+	unsigned long addr, new_addr, bpf_loop_addr, bpf_loop_term_addr;
+	bpf_loop_addr = (unsigned long)bpf_loop_proto.func;
+	bpf_loop_term_addr = (unsigned long)bpf_loop_termination;
+
+	unwind_start(&state, current, regs, NULL);
+	addr = unwind_get_return_address(&state);
+
+	unsigned long stack_addr = regs->sp;
+	while (addr) {
+		if (is_bpf_address(prog, addr)) {
+			break;
+		} else {
+			const char *name = kallsyms_lookup(addr, NULL, NULL, NULL, str);
+			if (name) {
+				unsigned long lookup_addr = kallsyms_lookup_name(name);
+				if (lookup_addr && lookup_addr == bpf_loop_addr) {
+					while (*(unsigned long *)stack_addr != addr) {
+						stack_addr += 1;
+					}
+					*(unsigned long *)stack_addr = bpf_loop_term_addr;
+				}
+			}
+		}
+		unwind_next_frame(&state);
+		addr = unwind_get_return_address(&state);
+	}
  #endif
 	// TODO: we still need to do a stack walk to ensure a bpf_callback doesnt returns back to the actual bpf_loop
 	// but to our special bpf_loop_termination helper
