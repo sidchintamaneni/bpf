@@ -24052,10 +24052,57 @@ static int clone_patch_prog(struct bpf_verifier_env *env)
 	patch_prog->aux = aux;
 	/*
 	 * TODO: Copy all the fields required in patch_prog->aux for jiting
-	 * TODO: What could go wrong if I just do a memcpy
+	 * TODO: Copying all the static fields
 	 */
+	patch_prog->aux->used_map_cnt = prog->aux->used_map_cnt;
+	patch_prog->aux->used_btf_cnt = prog->aux->used_btf_cnt;
+	patch_prog->aux->max_ctx_offset = prog->aux->max_ctx_offset;
 	patch_prog->aux->stack_depth = prog->aux->stack_depth;
-	patch_prog->aux->num_exentries = prog->aux->num_exentries;
+
+//	patch_prog->aux->id = prog->aux->id; /* Allocated after bpf_prog_select_runtime */
+	patch_prog->aux->func_cnt = prog->aux->func_cnt; /* will be populated by jit_subprogs */
+	patch_prog->aux->real_func_cnt = prog->aux->real_func_cnt; /* will be populated by jit_subprogs */
+	patch_prog->aux->func_idx = prog->aux->func_idx; /* will be populated by jit_subprogs */
+	patch_prog->aux->attach_btf_id = prog->aux->attach_btf_id;
+	patch_prog->aux->attach_st_ops_member_off = prog->aux->attach_st_ops_member_off;
+	patch_prog->aux->ctx_arg_info_size = prog->aux->ctx_arg_info_size;
+	patch_prog->aux->max_rdonly_access = prog->aux->max_rdonly_access;
+	patch_prog->aux->max_rdwr_access = prog->aux->max_rdwr_access;
+	patch_prog->aux->verifier_zext = prog->aux->verifier_zext;
+	patch_prog->aux->dev_bound = prog->aux->dev_bound;
+	patch_prog->aux->offload_requested = prog->aux->offload_requested;
+	patch_prog->aux->attach_btf_trace = prog->aux->attach_btf_trace;
+	patch_prog->aux->attach_tracing_prog = prog->aux->attach_tracing_prog;
+	patch_prog->aux->func_proto_unreliable = prog->aux->func_proto_unreliable;
+	patch_prog->aux->tail_call_reachable = prog->aux->tail_call_reachable;
+	patch_prog->aux->xdp_has_frags = prog->aux->xdp_has_frags;
+	patch_prog->aux->exception_cb = prog->aux->exception_cb;
+	patch_prog->aux->exception_boundary = prog->aux->exception_boundary;
+	patch_prog->aux->is_extended = prog->aux->is_extended;
+	patch_prog->aux->jits_use_priv_stack = prog->aux->jits_use_priv_stack;
+	patch_prog->aux->priv_stack_requested = prog->aux->priv_stack_requested;
+	patch_prog->aux->changes_pkt_data = prog->aux->changes_pkt_data;
+	patch_prog->aux->might_sleep = prog->aux->might_sleep;
+	patch_prog->aux->prog_array_member_cnt = prog->aux->prog_array_member_cnt;
+	patch_prog->aux->size_poke_tab = prog->aux->size_poke_tab;
+	/* Avoided copying load_time, verified_insns */
+	patch_prog->aux->cgroup_atype = prog->aux->cgroup_atype;
+	patch_prog->aux->linfo = prog->aux->linfo; /* Added to avoid null deref in JIT */
+	patch_prog->aux->func_info_cnt = prog->aux->func_info_cnt; /* resulting null ptr deref in core:630 */
+	patch_prog->aux->nr_linfo = prog->aux->nr_linfo;
+	patch_prog->aux->linfo_idx = prog->aux->linfo_idx;
+	patch_prog->aux->num_exentries = prog->aux->num_exentries; /* required for jit */
+
+	// Clone poke_tab
+	patch_prog->aux->poke_tab = kmalloc_array(patch_prog->aux->size_poke_tab, 
+					sizeof(struct bpf_jit_poke_descriptor), GFP_KERNEL);
+	if (!patch_prog->aux->poke_tab)
+		return -ENOMEM;
+	
+	for (int i = 0; i < patch_prog->aux->size_poke_tab; i++) {
+		memcpy(&patch_prog->aux->poke_tab[i], &prog->aux->poke_tab[i], 
+				sizeof(struct bpf_jit_poke_descriptor));
+	}
 
 	memcpy(patch_prog->insnsi, prog->insnsi, bpf_prog_insn_size(prog));
 
@@ -24067,7 +24114,7 @@ static int clone_patch_prog(struct bpf_verifier_env *env)
 		prog_name_len = BPF_OBJ_NAME_LEN - strlen(patch_prefix) - 1;
 	}
 	strncat(patch_prog->aux->name, prog->aux->name, prog_name_len);
-
+	
 	prog->term_states->patch_prog = patch_prog;
 
 	return 0;
@@ -24122,16 +24169,16 @@ static int prepare_patch_prog(struct bpf_verifier_env *env)
 		return err;
 
 	char debug[] = "prepare_patch_prog: After cloning patch prog\n";
-	debug_bpf_prog(debug, env->prog);
-	debug_bpf_prog(debug, env->prog->term_states->patch_prog);
+	//debug_bpf_prog(debug, env->prog);
+	//debug_bpf_prog(debug, env->prog->term_states->patch_prog);
 
 	err = patch_call_sites(env);
 	if (err)
 		return err;
 
 	char debug2[] = "prepare_patch_prog: After patching callsites\n";
-	debug_bpf_prog(debug2, env->prog);
-	debug_bpf_prog(debug2, env->prog->term_states->patch_prog);
+	//debug_bpf_prog(debug2, env->prog);
+	//debug_bpf_prog(debug2, env->prog->term_states->patch_prog);
 
 	return err;
 }
@@ -24162,8 +24209,8 @@ static int fixup_patch_prog(struct bpf_verifier_env *env, union bpf_attr *attr)
 		err = fixup_call_args(patch_env);
 
 	char debug2[] = "fixup_patch_prog: After jiting (incase of subprogs)\n";
-	debug_bpf_prog(debug2, env->prog);
-	debug_bpf_prog(debug2, env->prog->term_states->patch_prog);
+	//debug_bpf_prog(debug2, env->prog);
+	//debug_bpf_prog(debug2, env->prog->term_states->patch_prog);
 
 	kfree(patch_env);
 
@@ -24340,7 +24387,7 @@ skip_full_check:
 
 	if (ret == 0) {
 		char debug[] = "bpf_check: before calling do_misc_fixups\n";
-		debug_bpf_prog(debug, env->prog);
+		//debug_bpf_prog(debug, env->prog);
 	}
 
 	if (ret == 0)

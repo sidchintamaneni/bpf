@@ -2779,26 +2779,24 @@ static int sanity_check_jit_len(struct bpf_prog *prog)
 	char prog_prefix[] = "bpf_prog";
 	char patch_prog_prefix[] = "patch_bpf_prog";
 	struct bpf_prog *patch_prog = prog->term_states->patch_prog;
-	if (!strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
-		if(!strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
-			pr_info("sanity_check_jit_len: prog->jited_len %d\n", prog->jited_len);
-	      		pr_info("sanity_check_jit_len: patch_prog->jited_len %d\n", patch_prog->jited_len);
-		}
-	}
+	//if (strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))
+	//	|| strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
+	//		pr_info("sanity_check_jit_len: prog->jited_len %d\n", prog->jited_len);
+	//      		pr_info("sanity_check_jit_len: patch_prog->jited_len %d\n", patch_prog->jited_len);
+	//}
 
 	if (prog->jited_len != patch_prog->jited_len)
 		return -EFAULT;
 
-	if (!strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))) {
-		if(!strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
-	      	pr_info("sanity_check_jit_len: Dumping the jit data for debugging\n");
-	      	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
-	      		16, 1, prog->bpf_func, prog->jited_len, false);
+	//if (strncmp(prog_prefix, prog->aux->name, strlen(prog_prefix))
+	//	|| strncmp(patch_prog_prefix, prog->aux->name, strlen(patch_prog_prefix))) {	
+	//      	pr_info("sanity_check_jit_len: Dumping the jit data for debugging\n");
+	//      	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
+	//      		16, 1, prog->bpf_func, prog->jited_len, false);
 
-	      	print_hex_dump(KERN_INFO, "JIT code: patch_prog - ", DUMP_PREFIX_OFFSET,
-	      		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
-		}
-	}
+	//      	print_hex_dump(KERN_INFO, "JIT code: patch_prog - ", DUMP_PREFIX_OFFSET,
+	//      		16, 1, patch_prog->bpf_func, patch_prog->jited_len, false);
+	//}
 
 	return 0;
 
@@ -6119,9 +6117,6 @@ void bpf_die(void *data)
 		addr = unwind_get_return_address(&state);
 	}
  #endif
-	// TODO: we still need to do a stack walk to ensure a bpf_callback doesnt returns back to the actual bpf_loop
-	// but to our special bpf_loop_termination helper
-	atomic64_dec(&prog->aux->refcnt);
 
 	return;
 }

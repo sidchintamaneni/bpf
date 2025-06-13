@@ -320,6 +320,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 	}
 	if (fp->term_states) {
 		if (fp->term_states->patch_prog) {
+			kfree(fp->term_states->patch_prog->aux->poke_tab);
 			kfree(fp->term_states->patch_prog->aux);
 			vfree(fp->term_states->patch_prog);
 		}
