@@ -3636,6 +3636,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		addrs[i] = proglen;
 	}
 	ctx.cleanup_addr = proglen;
+	pr_info("bpf_int_jit_compile: init proglen %d\n", proglen);
 skip_init_addrs:
 
 	/*
@@ -3647,7 +3648,12 @@ skip_init_addrs:
 	for (pass = 0; pass < MAX_PASSES || image; pass++) {
 		if (!padding && pass >= PADDING_PASSES)
 			padding = true;
+		pr_info("bpf_int_jit_compile: pass %d\n", pass);
 		proglen = do_jit(prog, addrs, image, rw_image, oldproglen, &ctx, padding);
+		pr_info("bpf_int_jit_compile: addr values\n");
+		for (int iter = 0; iter <= prog->len; iter++) {
+			pr_info("bpf_int_jit_compile: addrs[%d] -> %d(0x%x)\n", iter, addrs[iter], addrs[iter]);
+		}
 		if (proglen <= 0) {
 out_image:
 			image = NULL;
@@ -3695,6 +3701,7 @@ out_image:
 			prog->aux->extable = (void *) image + roundup(proglen, align);
 		}
 		oldproglen = proglen;
+		pr_info("bpf_int_jit_compile: oldproglen %d\n", oldproglen);
 		cond_resched();
 	}
 

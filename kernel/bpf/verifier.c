@@ -21828,14 +21828,20 @@ static void __fixup_collection_insert_kfunc(struct bpf_insn_aux_data *insn_aux,
 }
 
 static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			    struct bpf_insn *insn_buf, int insn_idx, int *cnt)
+			    struct bpf_insn *insn_buf, int insn_idx, int *cnt, int *kfunc_btf_id)
 {
 	const struct bpf_kfunc_desc *desc;
+	struct bpf_kfunc_call_arg_meta meta;
+	int err;
 
 	if (!insn->imm) {
 		verbose(env, "invalid kernel function call not eliminated in verifier pass\n");
 		return -EINVAL;
 	}
+
+	err = fetch_kfunc_meta(env, insn, &meta, NULL);
+	if (err)
+		return err;
 
 	*cnt = 0;
 
@@ -21850,8 +21856,11 @@ static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return -EFAULT;
 	}
 
-	if (!bpf_jit_supports_far_kfunc_call())
+	if (!bpf_jit_supports_far_kfunc_call()) {
+		if (meta.kfunc_flags & KF_RET_NULL)
+			*kfunc_btf_id = insn->imm;
 		insn->imm = BPF_CALL_IMM(desc->addr);
+	}
 	if (insn->off)
 		return 0;
 	if (desc->func_id == special_kfunc_list[KF_bpf_obj_new_impl] ||
@@ -21961,6 +21970,13 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 	return 0;
 }
 
+static bool is_bpf_loop_call(struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+		insn->src_reg == 0 &&
+		insn->imm == BPF_FUNC_loop;
+}
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -21981,7 +21997,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 	struct bpf_subprog_info *subprogs = env->subprog_info;
 	u16 stack_depth = subprogs[cur_subprog].stack_depth;
 	u16 stack_depth_extra = 0;
+	u32 call_sites_cnt = 0;
+	int *call_idx;
 
+	call_idx = vmalloc(sizeof(*call_idx) * prog->len);
+	if (!call_idx)
+		return -ENOMEM;
 	if (env->seen_exception && !env->exception_callback_subprog) {
 		struct bpf_insn *patch = insn_buf;
 
@@ -22310,11 +22331,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		if (insn->src_reg == BPF_PSEUDO_CALL)
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
-			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt);
+			int kfunc_btf_id = 0;
+			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt, &kfunc_btf_id);
 			if (ret)
 				return ret;
 			if (cnt == 0)
-				goto next_insn;
+				goto store_call_indices;
 
 			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
 			if (!new_prog)
@@ -22323,6 +22345,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			delta	 += cnt - 1;
 			env->prog = prog = new_prog;
 			insn	  = new_prog->insnsi + i + delta;
+store_call_indices:
+			if (kfunc_btf_id != 0) {
+				call_idx[call_sites_cnt] = i + delta;
+				call_sites_cnt++;
+			
+			}
 			goto next_insn;
 		}
 
@@ -22801,6 +22829,11 @@ patch_call_imm:
 				     func_id_name(insn->imm), insn->imm);
 			return -EFAULT;
 		}
+
+		if ((fn->ret_type & PTR_MAYBE_NULL) || is_bpf_loop_call(insn)) {
+			call_idx[call_sites_cnt] = i + delta;
+			call_sites_cnt++;
+		}
 		insn->imm = fn->func - __bpf_call_base;
 next_insn:
 		if (subprogs[cur_subprog + 1].start == i + delta + 1) {
@@ -22821,6 +22854,8 @@ next_insn:
 		insn++;
 	}
 
+	env->prog->term_states->patch_call_sites->call_sites_cnt = call_sites_cnt;
+	env->prog->term_states->patch_call_sites->call_idx = call_idx;
 	env->prog->aux->stack_depth = subprogs[0].stack_depth;
 	for (i = 0; i < env->subprog_cnt; i++) {
 		int delta = bpf_jit_supports_timed_may_goto() ? 2 : 1;
@@ -22956,15 +22991,11 @@ static struct bpf_prog *inline_bpf_loop(struct bpf_verifier_env *env,
 	call_insn_offset = position + 12;
 	callback_offset = callback_start - call_insn_offset - 1;
 	new_prog->insnsi[call_insn_offset].imm = callback_offset;
+	/* Marking offset field to identify and patch for patch_prog */
+	/* TODO: see how we can this condition later */
+	new_prog->insnsi[call_insn_offset].off = 0x1;
 
 	return new_prog;
-}
-
-static bool is_bpf_loop_call(struct bpf_insn *insn)
-{
-	return insn->code == (BPF_JMP | BPF_CALL) &&
-		insn->src_reg == 0 &&
-		insn->imm == BPF_FUNC_loop;
 }
 
 /* For all sub-programs in the program (including main) check
@@ -24520,6 +24551,37 @@ exit:
 	return err;
 }
 
+static void debug_bpf_prog(char *str, struct bpf_prog *prog)
+{
+	if (strncmp(prog->aux->name, "bpf_prog", 8))
+		return;
+
+	pr_info("********************************************************************");
+	pr_info("%s\n", str);
+	pr_info("********************************************************************");
+	pr_info("debug_bpf_prog: DEBUG INFO\n");
+	pr_info("debug_bpf_prog: prog->aux->name - %s, prog->len %d\n", prog->aux->name, prog->len);
+
+	pr_info("code\tdst_reg\tsrc_reg\toff\t\timm\n");
+	for (int i = 0; i < prog->len; i++) {
+		pr_info("0x%x\t0x%x\t0x%x\t0x%x\t\t0x%x\n", prog->insnsi[i].code,
+                               prog->insnsi[i].dst_reg,
+                               prog->insnsi[i].src_reg,
+                               prog->insnsi[i].off,
+                               prog->insnsi[i].imm);
+	}
+
+	if (prog->term_states->patch_call_sites) {
+		if (prog->term_states->patch_call_sites->call_sites_cnt != 0) {
+			pr_info("debug_bpf_prog: patch_call_sites->call_idx: ");
+			for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
+				pr_info("%d ", prog->term_states->patch_call_sites->call_idx[i]);	
+			}
+			pr_info("\n");
+		}
+	}
+}
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -24693,8 +24755,14 @@ skip_full_check:
 		/* program is valid, convert *(u32*)(ctx + off) accesses */
 		ret = convert_ctx_accesses(env);
 
+	char debug[] = "do_check: before do_misc_fixups\n";
+	debug_bpf_prog(debug, env->prog);
+
 	if (ret == 0)
 		ret = do_misc_fixups(env);
+	
+	char debug2[] = "do_check: after do_misc_fixups\n";
+	debug_bpf_prog(debug2, env->prog);
 
 	/* do 32-bit optimization after insn patching has done so those patched
 	 * insns could be handled correctly.
