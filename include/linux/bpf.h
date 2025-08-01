@@ -39,6 +39,7 @@ struct bpf_prog;
 struct bpf_prog_aux;
 struct bpf_map;
 struct bpf_arena;
+struct bpf_term_aux_states;
 struct sock;
 struct seq_file;
 struct btf;
@@ -1569,6 +1570,24 @@ struct bpf_stream_stage {
 	int len;
 };
 
+struct call_aux_states {
+	int call_idx;
+	u8 is_helper;
+	u8 is_kfunc;
+	u8 is_bpf_loop;
+	u8 is_bpf_loop_cb;
+};
+
+struct bpf_term_patch_call_sites {
+	u32 call_sites_cnt;
+	struct call_aux_states *call_states;
+};
+
+struct bpf_term_aux_states {
+	u8 flag; /* using as a placeholder fn */
+	struct bpf_term_patch_call_sites *patch_call_sites;
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1708,6 +1727,7 @@ struct bpf_prog {
 					    const struct bpf_insn *insn);
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+	struct bpf_term_aux_states *term_states; /* Program termination aux fields */
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);

@@ -3739,6 +3739,16 @@ out_image:
 		prog = orig_prog;
 	}
 
+
+		pr_info("bpf_int_jit_compile: getting jit_data_tmp\n");
+		if (addrs){
+			pr_info("bpf_int_jit_compile: addrs\n");
+			for (int i = 0; i < prog->len; i++){
+				pr_info("bpf_int_jit_compile: addrs[%d]->%d(%x)\n", i, addrs[i], 
+						addrs[i]);
+			}
+		}
+
 	if (!image || !prog->is_func || extra_pass) {
 		if (image)
 			bpf_prog_fill_jited_linfo(prog, addrs + 1);
@@ -3748,6 +3758,9 @@ out_addrs:
 			free_percpu(priv_stack_ptr);
 			prog->aux->priv_stack_ptr = NULL;
 		}
+			pr_info("bpf_int_jit_compile: extra_pass %d\n", extra_pass);
+			pr_info("bpf_int_jit_compile: !image %d\n", !image);
+			pr_info("bpf_int_jit_compile: !prog->is_func %d\n", !prog->is_func);
 out_priv_stack:
 		kfree(jit_data);
 		prog->aux->jit_data = NULL;
@@ -3756,6 +3769,8 @@ out:
 	if (tmp_blinded)
 		bpf_jit_prog_release_other(prog, prog == orig_prog ?
 					   tmp : orig_prog);
+
+
 	return prog;
 }
 
