@@ -1572,6 +1572,7 @@ struct bpf_stream_stage {
 
 struct call_aux_states {
 	int call_idx;
+	int jit_call_idx;
 	u8 is_helper;
 	u8 is_kfunc;
 	u8 is_bpf_loop;

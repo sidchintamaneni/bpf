@@ -3740,16 +3740,24 @@ out_image:
 	}
 
 
-		pr_info("bpf_int_jit_compile: getting jit_data_tmp\n");
-		if (addrs){
-			pr_info("bpf_int_jit_compile: addrs\n");
-			for (int i = 0; i < prog->len; i++){
-				pr_info("bpf_int_jit_compile: addrs[%d]->%d(%x)\n", i, addrs[i], 
-						addrs[i]);
-			}
+	if (addrs){
+		pr_info("bpf_int_jit_compile: addrs\n");
+		for (int i = 0; i < prog->len; i++){
+			pr_info("bpf_int_jit_compile: addrs[%d]->%d(%x)\n", i, addrs[i], 
+					addrs[i]);
 		}
+	}
 
 	if (!image || !prog->is_func || extra_pass) {
+		pr_info("bpf_int_jit_compile: getting jit_data_tmp\n");
+		/* I don't think check is necessary*/
+		if (addrs) {
+			struct bpf_term_patch_call_sites *patch_call_sites = prog->term_states->patch_call_sites;
+			for (int i = 0; i < patch_call_sites->call_sites_cnt; i++){
+				struct call_aux_states *call_states = patch_call_sites->call_states + i;	
+				call_states->jit_call_idx = addrs[call_states->call_idx];
+			}
+		}
 		if (image)
 			bpf_prog_fill_jited_linfo(prog, addrs + 1);
 out_addrs:
@@ -3758,9 +3766,9 @@ out_addrs:
 			free_percpu(priv_stack_ptr);
 			prog->aux->priv_stack_ptr = NULL;
 		}
-			pr_info("bpf_int_jit_compile: extra_pass %d\n", extra_pass);
-			pr_info("bpf_int_jit_compile: !image %d\n", !image);
-			pr_info("bpf_int_jit_compile: !prog->is_func %d\n", !prog->is_func);
+		pr_info("bpf_int_jit_compile: extra_pass %d\n", extra_pass);
+		pr_info("bpf_int_jit_compile: !image %d\n", !image);
+		pr_info("bpf_int_jit_compile: !prog->is_func %d\n", !prog->is_func);
 out_priv_stack:
 		kfree(jit_data);
 		prog->aux->jit_data = NULL;

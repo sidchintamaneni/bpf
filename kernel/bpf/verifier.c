@@ -21551,6 +21551,30 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->poke_tab = prog->aux->poke_tab;
 		func[i]->aux->size_poke_tab = prog->aux->size_poke_tab;
 
+		/* Updating termination aux states */
+		pr_info("jit_subprogs: updating termination_aux_states for subprog %d\n", i);
+		if (prog->term_states->patch_call_sites->call_sites_cnt != 0) {
+			int call_sites_cnt = 0;
+			struct call_aux_states *func_call_states;
+			func_call_states = vmalloc(sizeof(*func_call_states) * len); 
+			/* TODO: resource cleanup */
+			if (!func_call_states)
+				goto out_free;
+			memset(func_call_states, 0, sizeof(*func_call_states) * len);
+			for (int iter = 0; iter < prog->term_states->patch_call_sites->call_sites_cnt; iter++) {
+				struct call_aux_states call_states = prog->term_states->patch_call_sites->call_states[iter];
+				/* Don't have to loop through the entire call_sites_cnt */
+				if (call_states.call_idx >= subprog_start
+						&& call_states.call_idx < subprog_end) {
+					func_call_states[call_sites_cnt] = call_states; 
+					func_call_states[call_sites_cnt].call_idx -= subprog_start;
+					call_sites_cnt++;
+				}
+			}
+			func[i]->term_states->patch_call_sites->call_sites_cnt = call_sites_cnt;
+			func[i]->term_states->patch_call_sites->call_states = func_call_states;
+		}
+
 		for (j = 0; j < prog->aux->size_poke_tab; j++) {
 			struct bpf_jit_poke_descriptor *poke;
 
@@ -24567,6 +24591,34 @@ exit:
 	return err;
 }
 
+static void debug_bpf_prog_call_sites(char *str, struct bpf_prog *prog)
+{
+	if (strncmp(prog->aux->name, "bpf_prog", 8))
+		return;
+
+	if (prog->term_states->patch_call_sites) {
+		if (prog->term_states->patch_call_sites->call_sites_cnt != 0) {
+			pr_info("debug_bpf_prog_call_sites: patch_call_sites->jit_call_idx:\n");
+			for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
+				pr_info("debug_bpf_prog_call_sites: %d\n", prog->term_states->patch_call_sites->call_states[i].jit_call_idx);	
+			}
+		}
+	}
+
+	pr_info("debug_bpf_prog_call_sites: prog->subprogs count %d\n", prog->aux->func_cnt);
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		if (prog->aux->func[subprog]->term_states->patch_call_sites) {
+			if (prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt != 0) {
+				pr_info("debug_bpf_prog_call_sites: patch_call_sites->jit_call_idx:\n");
+				for (int i = 0; i < prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt; i++) {
+					pr_info("debug_bpf_prog_call_sites: %d\n", 
+						prog->aux->func[subprog]->term_states->patch_call_sites->call_states[i].jit_call_idx);	
+				}
+			}
+		}
+	}
+}
+
 static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 {
 	if (strncmp(prog->aux->name, "bpf_prog", 8))
@@ -24592,6 +24644,29 @@ static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 			pr_info("debug_bpf_prog: patch_call_sites->call_idx:\n");
 			for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
 				pr_info("debug_bpf_prog: %d\n", prog->term_states->patch_call_sites->call_states[i].call_idx);	
+			}
+		}
+	}
+
+	pr_info("debug_bpf_prog: prog->subprogs count %d\n", prog->aux->func_cnt);
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		pr_info("debug_bpf_prog: subprog[%d] - jited_len %d\n", 
+					subprog, prog->aux->func[subprog]->jited_len);
+		for (int i = 0; i < prog->len; i++) {
+			pr_info("0x%02x\t0x%01x\t0x%01x\t0x%04x\t\t0x%08x\n",
+					prog->aux->func[subprog]->insnsi[i].code,
+					prog->aux->func[subprog]->insnsi[i].dst_reg,
+					prog->aux->func[subprog]->insnsi[i].src_reg,
+       			                prog->aux->func[subprog]->insnsi[i].off & 0xFFFF,
+					prog->aux->func[subprog]->insnsi[i].imm & 0xFFFFFFFF);
+		}
+		if (prog->aux->func[subprog]->term_states->patch_call_sites) {
+			if (prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt != 0) {
+				pr_info("debug_bpf_prog: patch_call_sites->call_idx:\n");
+				for (int i = 0; i < prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt; i++) {
+					pr_info("debug_bpf_prog: %d\n", 
+						prog->aux->func[subprog]->term_states->patch_call_sites->call_states[i].call_idx);	
+				}
 			}
 		}
 	}
@@ -24826,6 +24901,9 @@ skip_full_check:
 
 	char debug3[] = "do_check: after fixup_call_args\n";
 	debug_bpf_prog(debug3, env->prog);
+
+	char debug4[] = "do_check: after fixup_call_args - printing jit_call_sites\n";
+	debug_bpf_prog_call_sites(debug4, env->prog);
 
 	env->verification_time = ktime_get_ns() - start_time;
 	print_verification_stats(env);

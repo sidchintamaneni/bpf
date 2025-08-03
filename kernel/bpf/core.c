@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-Limense-Identifier: GPL-2.0-or-later
 /*
  * Linux Socket Filter - Kernel level socket filtering
  *
@@ -134,6 +134,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	fp->blinding_requested = bpf_jit_blinding_enabled(fp);
 	fp->term_states = term_states;
 	fp->term_states->patch_call_sites = patch_call_sites;
+	fp->term_states->patch_call_sites->call_sites_cnt = 0;
 #ifdef CONFIG_CGROUP_BPF
 	aux->cgroup_atype = CGROUP_BPF_ATTACH_TYPE_INVALID;
 #endif
