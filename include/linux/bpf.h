@@ -72,6 +72,8 @@ typedef int (*bpf_iter_init_seq_priv_t)(void *private_data,
 typedef void (*bpf_iter_fini_seq_priv_t)(void *private_data);
 typedef unsigned int (*bpf_func_t)(const void *,
 				   const struct bpf_insn *);
+void bpf_softlockup(u32 dur_s);
+
 struct bpf_iter_seq_info {
 	const struct seq_operations *seq_ops;
 	bpf_iter_init_seq_priv_t init_seq_private;
@@ -1586,6 +1588,8 @@ struct bpf_term_patch_call_sites {
 
 struct bpf_term_aux_states {
 	u8 flag; /* using as a placeholder fn */
+	struct bpf_prog *prog;
+	struct work_struct work;
 	struct bpf_term_patch_call_sites *patch_call_sites;
 };
 

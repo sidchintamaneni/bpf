@@ -3766,6 +3766,7 @@ out_addrs:
 			free_percpu(priv_stack_ptr);
 			prog->aux->priv_stack_ptr = NULL;
 		}
+
 		pr_info("bpf_int_jit_compile: extra_pass %d\n", extra_pass);
 		pr_info("bpf_int_jit_compile: !image %d\n", !image);
 		pr_info("bpf_int_jit_compile: !prog->is_func %d\n", !prog->is_func);

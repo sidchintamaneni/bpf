@@ -21515,6 +21515,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 
 	err = bpf_prog_alloc_jited_linfo(prog);
 	if (err)
+
 		goto out_undo_insn;
 
 	err = -ENOMEM;
@@ -24591,34 +24592,6 @@ exit:
 	return err;
 }
 
-static void debug_bpf_prog_call_sites(char *str, struct bpf_prog *prog)
-{
-	if (strncmp(prog->aux->name, "bpf_prog", 8))
-		return;
-
-	if (prog->term_states->patch_call_sites) {
-		if (prog->term_states->patch_call_sites->call_sites_cnt != 0) {
-			pr_info("debug_bpf_prog_call_sites: patch_call_sites->jit_call_idx:\n");
-			for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
-				pr_info("debug_bpf_prog_call_sites: %d\n", prog->term_states->patch_call_sites->call_states[i].jit_call_idx);	
-			}
-		}
-	}
-
-	pr_info("debug_bpf_prog_call_sites: prog->subprogs count %d\n", prog->aux->func_cnt);
-	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
-		if (prog->aux->func[subprog]->term_states->patch_call_sites) {
-			if (prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt != 0) {
-				pr_info("debug_bpf_prog_call_sites: patch_call_sites->jit_call_idx:\n");
-				for (int i = 0; i < prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt; i++) {
-					pr_info("debug_bpf_prog_call_sites: %d\n", 
-						prog->aux->func[subprog]->term_states->patch_call_sites->call_states[i].jit_call_idx);	
-				}
-			}
-		}
-	}
-}
-
 static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 {
 	if (strncmp(prog->aux->name, "bpf_prog", 8))
@@ -24901,9 +24874,6 @@ skip_full_check:
 
 	char debug3[] = "do_check: after fixup_call_args\n";
 	debug_bpf_prog(debug3, env->prog);
-
-	char debug4[] = "do_check: after fixup_call_args - printing jit_call_sites\n";
-	debug_bpf_prog_call_sites(debug4, env->prog);
 
 	env->verification_time = ktime_get_ns() - start_time;
 	print_verification_stats(env);

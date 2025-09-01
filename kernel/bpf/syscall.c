@@ -2775,6 +2775,37 @@ static void debug_bpf_prog_jit(struct bpf_prog *prog)
 	return;
 }
 
+
+static void debug_bpf_prog_call_sites(struct bpf_prog *prog)
+{
+	if (strncmp(prog->aux->name, "bpf_prog", 8))
+		return;
+
+	if (prog->aux->func_cnt == 0 && prog->term_states->patch_call_sites) {
+		if (prog->term_states->patch_call_sites->call_sites_cnt != 0) {
+			pr_info("debug_bpf_prog_call_sites: patch_call_sites->jit_call_idx:\n");
+			for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
+				pr_info("debug_bpf_prog_call_sites: %d\n", prog->term_states->patch_call_sites->call_states[i].jit_call_idx);	
+			}
+		}
+	}
+
+	pr_info("debug_bpf_prog_call_sites: prog->subprogs count %d\n", prog->aux->func_cnt);
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		pr_info("debug_bpf_prog_call_sites: prog->subprogs %d\n", subprog);
+		if (prog->aux->func[subprog]->term_states->patch_call_sites) {
+			if (prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt != 0) {
+				pr_info("debug_bpf_prog_call_sites: patch_call_sites->jit_call_idx:\n");
+				for (int i = 0; i < prog->aux->func[subprog]->term_states->patch_call_sites->call_sites_cnt; i++) {
+					pr_info("debug_bpf_prog_call_sites: %d\n", 
+						prog->aux->func[subprog]->term_states->patch_call_sites->call_states[i].jit_call_idx);	
+				}
+			}
+		}
+	}
+}
+
+
 struct jit_context {
 	int cleanup_addr;
 	int tail_call_direct_label;
@@ -3009,12 +3040,12 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (err < 0)
 		goto free_used_maps;
 
-	pr_info("bpf_prog_load: just for ref");
 	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
 
 	debug_bpf_prog_jit(prog);
+	debug_bpf_prog_call_sites(prog);
 
 	err = bpf_prog_alloc_id(prog);
 	if (err)

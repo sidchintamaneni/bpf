@@ -40,6 +40,7 @@
 #include <linux/execmem.h>
 
 #include <asm/barrier.h>
+#include <asm/unwind.h>
 #include <linux/unaligned.h>
 
 /* Registers */
@@ -94,6 +95,146 @@ enum page_size_enum {
 	__PAGE_SIZE = PAGE_SIZE
 };
 
+void *bpf_termination_null_func(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+{
+	return NULL;
+}
+
+int bpf_loop_term_callback(u64 reg_loop_cnt, u64 *reg_loop_ctx)
+{
+	return 1;
+}
+
+static void __maybe_unused in_place_patch_bpf_prog(struct bpf_prog *prog)
+{
+	struct call_aux_states *call_states;
+	unsigned long new_target;
+	unsigned char *addr;
+
+	pr_info("in_place_patch_bpf_prog: starts here..\n");
+	call_states = prog->term_states->patch_call_sites->call_states;
+	for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
+		pr_info("in_place_patch_bpf_prog: call_sites[%d]\n", i);
+		int jit_call_idx = call_states[i].jit_call_idx;
+		pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d\n", i, jit_call_idx);
+		
+		new_target = (unsigned long) bpf_termination_null_func;
+		if (call_states[i].is_bpf_loop_cb) {
+			new_target = (unsigned long) bpf_loop_term_callback;	
+		}
+		pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d, new_target 0x%lx\n", i, jit_call_idx, new_target);
+
+		char new_insn[5];
+
+		addr = (unsigned char *)prog->bpf_func + jit_call_idx;
+
+		pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d, addr 0x%lx\n", i, jit_call_idx, (unsigned long)addr);
+		unsigned long new_rel = (unsigned long)(new_target - (unsigned long)(addr + 5));
+		new_insn[0] = 0xE8;
+		new_insn[1] = (new_rel >> 0) & 0xff;
+		new_insn[2] = (new_rel >> 8) & 0xff;
+		new_insn[3] = (new_rel >> 16) & 0xff;
+		new_insn[4] = (new_rel >> 24) & 0xff;
+
+		smp_text_poke_batch_add(addr, new_insn, 5 /* call instruction len */, NULL);
+	}
+
+	smp_text_poke_batch_finish();
+}
+
+void bpf_die(struct bpf_prog *prog)
+{
+
+	pr_info("bpf_die: starts here..\n");
+	/*
+	 * Replace the 5B noop with a jmp to `jmp return_thunk` located at the end of bpf_func
+	 * TODO: if CONFIG is not to generate return_call_thunk then replace with ret instruction.
+	 */
+	unsigned long jmp_offset = prog->jited_len - (4 /* First endbr is 4 bytes */ 
+					+ 5 /* noop is 5 bytes */ 
+					+ 5 /* 5 bytes of jmp return_thunk */);
+
+	char new_insn[5];
+	/*
+	 * Relative Jump?
+	 */
+	new_insn[0] = 0xE9;
+	new_insn[1] = (jmp_offset >> 0) & 0xff;
+	new_insn[2] = (jmp_offset >> 8) & 0xff;
+	new_insn[3] = (jmp_offset >> 16) & 0xff;
+	new_insn[4] = (jmp_offset >> 24) & 0xff;
+
+	pr_info("bpf_die: poking to enable global termination\n");
+	smp_text_poke_batch_add(prog->bpf_func + 4, new_insn, 5, NULL);
+
+	if (prog->aux->func_cnt) {
+		pr_info("bpf_die: subprogs exists..\n");
+		for (int i = 0; i < prog->aux->func_cnt; i++) {
+			pr_info("bpf_die: poking subprog[%d]\n", i);
+			in_place_patch_bpf_prog(prog->aux->func[i]);
+		}
+	} else {
+		pr_info("bpf_die: poking the main prog\n");
+		in_place_patch_bpf_prog(prog);
+	}
+
+	/* flush all text poke calls */
+	smp_text_poke_batch_finish();
+
+}
+
+static void bpf_prog_termination_deferred(struct work_struct *work)
+{
+	pr_info("bpf_prog_termination_deferred: CPU %d, triggering fast path termination\n",
+			smp_processor_id());
+
+	struct bpf_term_aux_states *term_states = container_of(work, struct bpf_term_aux_states,
+						 work);
+
+	struct bpf_prog *prog = term_states->prog;
+
+	pr_info("bpf_prog_termination_deferred: prog 0x%lx\n", (unsigned long)prog);
+	pr_info("bpf_prog_termination_deferred: prog->aux->name %s\n", prog->aux->name);
+	
+	bpf_die(prog);
+}
+
+static struct workqueue_struct *bpf_termination_wq;
+
+void bpf_softlockup(u32 dur_s)
+{
+	pr_info("bpf_softlockup: Soft lockup - CPU %d stuck for %us, triggering fast path termination\n",
+			smp_processor_id(), dur_s);
+
+	unsigned long addr;
+	struct unwind_state state;
+	struct bpf_prog *prog;
+
+	for (unwind_start(&state, current, NULL, NULL); !unwind_done(&state);
+	     unwind_next_frame(&state)) {
+		addr = unwind_get_return_address(&state);
+		if (!addr)
+			break;
+
+		if (!is_bpf_text_address(addr))
+			continue;
+
+		pr_info("bpf_softlockup: addr 0x%lx\n", addr);
+		prog = bpf_prog_ksym_find(addr);
+		pr_info("bpf_softlockup: prog 0x%lx\n", (unsigned long)prog);
+		if (bpf_is_subprog(prog))
+			continue;
+
+		bpf_termination_wq = alloc_workqueue("bpf_termination_wq", WQ_UNBOUND, 1);
+		if (!bpf_termination_wq)
+			panic("Failed to alloc workqueue for bpf termination.\n");
+
+		pr_info("bpf_softlockup: after subprog conversion prog 0x%lx\n", (unsigned long)prog);
+		queue_work(bpf_termination_wq, &prog->term_states->work);
+		break;
+	}
+}
+
 struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flags)
 {
 	gfp_t gfp_flags = bpf_memcg_flags(GFP_KERNEL | __GFP_ZERO | gfp_extra_flags);
@@ -135,6 +276,8 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	fp->term_states = term_states;
 	fp->term_states->patch_call_sites = patch_call_sites;
 	fp->term_states->patch_call_sites->call_sites_cnt = 0;
+	fp->term_states->prog = fp;
+	INIT_WORK(&fp->term_states->work, bpf_prog_termination_deferred);
 #ifdef CONFIG_CGROUP_BPF
 	aux->cgroup_atype = CGROUP_BPF_ATTACH_TYPE_INVALID;
 #endif
@@ -287,6 +430,7 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 		memcpy(fp, fp_old, fp_old->pages * PAGE_SIZE);
 		fp->pages = pages;
 		fp->aux->prog = fp;
+		fp->term_states->prog = fp;
 
 		/* We keep fp->aux from fp_old around in the new
 		 * reallocated structure.
@@ -294,6 +438,7 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 		fp_old->aux = NULL;
 		fp_old->stats = NULL;
 		fp_old->active = NULL;
+		fp_old->term_states = NULL;
 		__bpf_prog_free(fp_old);
 	}
 
@@ -818,6 +963,7 @@ struct bpf_prog *bpf_prog_ksym_find(unsigned long addr)
 	       container_of(ksym, struct bpf_prog_aux, ksym)->prog :
 	       NULL;
 }
+EXPORT_SYMBOL_GPL(bpf_prog_ksym_find);
 
 const struct exception_table_entry *search_bpf_extables(unsigned long addr)
 {
