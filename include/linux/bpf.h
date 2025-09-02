@@ -1625,6 +1625,7 @@ struct bpf_prog_aux {
 	bool attach_tracing_prog; /* true if tracing another tracing program */
 	bool func_proto_unreliable;
 	bool tail_call_reachable;
+	bool is_bpf_loop_callback; /* true if this subprogram is a BPF loop callback */
 	bool xdp_has_frags;
 	bool exception_cb;
 	bool exception_boundary;

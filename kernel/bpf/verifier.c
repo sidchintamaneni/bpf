@@ -21554,6 +21554,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 
 		/* Updating termination aux states */
 		pr_info("jit_subprogs: updating termination_aux_states for subprog %d\n", i);
+		func[i]->aux->is_bpf_loop_callback = false; /* default to false */
+		
 		if (prog->term_states->patch_call_sites->call_sites_cnt != 0) {
 			int call_sites_cnt = 0;
 			struct call_aux_states *func_call_states;
@@ -21569,6 +21571,13 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 						&& call_states.call_idx < subprog_end) {
 					func_call_states[call_sites_cnt] = call_states; 
 					func_call_states[call_sites_cnt].call_idx -= subprog_start;
+					
+					/* If this subprogram contains any BPF loop callback call sites,
+					 * mark the entire subprogram as a BPF loop callback */
+					if (call_states.is_bpf_loop_cb) {
+						func[i]->aux->is_bpf_loop_callback = true;
+					}
+					
 					call_sites_cnt++;
 				}
 			}
@@ -22870,9 +22879,24 @@ patch_call_imm:
 		}
 		if ((fn->ret_type & PTR_MAYBE_NULL) || is_bpf_loop_call(insn)) {
 			call_states[call_sites_cnt].call_idx = i + delta;
-			if (is_bpf_loop_call(insn))
+			if (is_bpf_loop_call(insn)) {
 				call_states[call_sites_cnt].is_bpf_loop = 1;
-			else
+				
+				/* Also track the callback if not inlined */
+				struct bpf_loop_inline_state *inline_state = 
+					&env->insn_aux_data[i + delta].loop_inline_state;
+					
+				if (!inline_state->fit_for_inline && inline_state->callback_subprogno >= 0) {
+					call_sites_cnt++; /* Move to next entry for callback */
+					
+					/* Mark subprogram as BPF loop callback */
+					env->subprog_info[inline_state->callback_subprogno].is_bpf_loop_cb = true;
+					
+					/* Track the callback subprogram entry point */
+					call_states[call_sites_cnt].call_idx = env->subprog_info[inline_state->callback_subprogno].start;
+					call_states[call_sites_cnt].is_bpf_loop_cb = 1;
+				}
+			} else
 				call_states[call_sites_cnt].is_helper = 1;
 			call_sites_cnt++;
 		}
@@ -24641,7 +24665,7 @@ static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 						prog->aux->func[subprog]->term_states->patch_call_sites->call_states[i].call_idx);	
 				}
 			}
-		}
+		}	
 	}
 
 }

@@ -513,7 +513,7 @@ static void emit_prologue_tail_call(u8 **pprog, bool is_subprog)
  */
 static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cbpf,
 			  bool tail_call_reachable, bool is_subprog,
-			  bool is_exception_cb)
+			  bool is_exception_cb, bool is_bpf_loop_callback)
 {
 	u8 *prog = *pprog;
 
@@ -524,8 +524,12 @@ static void emit_prologue(u8 **pprog, u8 *ip, u32 stack_depth, bool ebpf_from_cb
 	}
 	/* BPF trampoline can be made to work without these nops,
 	 * but let's waste 5 bytes for now and optimize later
+	 * For BPF loop callbacks, emit 6 NOPs to accommodate termination patch
 	 */
-	emit_nops(&prog, X86_PATCH_SIZE);
+	if (is_subprog && is_bpf_loop_callback)
+		emit_nops(&prog, 6); /* 6 NOPs for "mov $1, %eax; ret" patch */
+	else
+		emit_nops(&prog, X86_PATCH_SIZE); /* 5 NOPs */
 	if (!ebpf_from_cbpf) {
 		if (tail_call_reachable && !is_subprog)
 			/* When it's the entry of the whole tailcall context,
@@ -1581,7 +1585,8 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 
 	emit_prologue(&prog, image, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
-		      bpf_is_subprog(bpf_prog), bpf_prog->aux->exception_cb);
+		      bpf_is_subprog(bpf_prog), bpf_prog->aux->exception_cb,
+		      bpf_prog->aux->is_bpf_loop_callback);
 	/* Exception callback will clobber callee regs for its own use, and
 	 * restore the original callee regs from main prog's stack frame.
 	 */

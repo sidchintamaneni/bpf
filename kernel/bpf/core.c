@@ -118,25 +118,44 @@ static void __maybe_unused in_place_patch_bpf_prog(struct bpf_prog *prog)
 		int jit_call_idx = call_states[i].jit_call_idx;
 		pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d\n", i, jit_call_idx);
 		
-		new_target = (unsigned long) bpf_termination_null_func;
 		if (call_states[i].is_bpf_loop_cb) {
-			new_target = (unsigned long) bpf_loop_term_callback;	
+			/* For BPF loop callbacks, patch the 6 NOPs in prologue with "mov $1, %eax; ret" */
+			pr_info("in_place_patch_bpf_prog: patching BPF loop callback prologue\n");
+			
+			/* Calculate the address of the prologue NOPs 
+			 * The NOPs are after: endbr64 (4 bytes) + CFI (5 bytes) = 9 bytes offset */
+			addr = (unsigned char *)prog->bpf_func + 9;
+			
+			char callback_term_insn[6];
+			/* mov $1, %eax */
+			callback_term_insn[0] = 0xb8; /* MOV imm32 to %eax */
+			callback_term_insn[1] = 0x01; /* immediate value = 1 */
+			callback_term_insn[2] = 0x00;
+			callback_term_insn[3] = 0x00;
+			callback_term_insn[4] = 0x00;
+			/* ret */
+			callback_term_insn[5] = 0xc3; /* RET */
+			
+			pr_info("in_place_patch_bpf_prog: patching callback at 0x%lx with mov $1,%%eax; ret\n", (unsigned long)addr);
+			smp_text_poke_batch_add(addr, callback_term_insn, 6, NULL);
+		} else {
+			/* For regular call sites, patch with call to termination function */
+			new_target = (unsigned long) bpf_termination_null_func;
+			pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d, new_target 0x%lx\n", i, jit_call_idx, new_target);
+
+			char new_insn[5];
+			addr = (unsigned char *)prog->bpf_func + jit_call_idx;
+			pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d, addr 0x%lx\n", i, jit_call_idx, (unsigned long)addr);
+			
+			unsigned long new_rel = (unsigned long)(new_target - (unsigned long)(addr + 5));
+			new_insn[0] = 0xE8;
+			new_insn[1] = (new_rel >> 0) & 0xff;
+			new_insn[2] = (new_rel >> 8) & 0xff;
+			new_insn[3] = (new_rel >> 16) & 0xff;
+			new_insn[4] = (new_rel >> 24) & 0xff;
+
+			smp_text_poke_batch_add(addr, new_insn, 5 /* call instruction len */, NULL);
 		}
-		pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d, new_target 0x%lx\n", i, jit_call_idx, new_target);
-
-		char new_insn[5];
-
-		addr = (unsigned char *)prog->bpf_func + jit_call_idx;
-
-		pr_info("in_place_patch_bpf_prog: call_sites[%d]->jit_call_idx %d, addr 0x%lx\n", i, jit_call_idx, (unsigned long)addr);
-		unsigned long new_rel = (unsigned long)(new_target - (unsigned long)(addr + 5));
-		new_insn[0] = 0xE8;
-		new_insn[1] = (new_rel >> 0) & 0xff;
-		new_insn[2] = (new_rel >> 8) & 0xff;
-		new_insn[3] = (new_rel >> 16) & 0xff;
-		new_insn[4] = (new_rel >> 24) & 0xff;
-
-		smp_text_poke_batch_add(addr, new_insn, 5 /* call instruction len */, NULL);
 	}
 
 	smp_text_poke_batch_finish();
