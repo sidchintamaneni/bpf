@@ -2606,6 +2606,11 @@ emit_jmp:
 				if (arena_vm_start)
 					pop_r12(&prog);
 			}
+			/* emiting 5 byte nop for non-inline bpf_loop callback */
+			if (bpf_is_subprog(bpf_prog) && bpf_prog->aux->is_bpf_loop_cb_non_inline) {
+				pr_info("do_jit: emiting 5 byte nop for non-inline bpf_loop callback\n");
+				emit_nops(&prog, X86_PATCH_SIZE);
+			}
 			EMIT1(0xC9);         /* leave */
 			emit_return(&prog, image + addrs[i - 1] + (prog - temp));
 			break;

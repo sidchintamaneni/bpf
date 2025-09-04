@@ -139,6 +139,15 @@ static void __maybe_unused in_place_patch_bpf_prog(struct bpf_prog *prog)
 		smp_text_poke_batch_add(addr, new_insn, 5 /* call instruction len */, NULL);
 	}
 
+	if (prog->aux->is_bpf_loop_cb_non_inline) {
+		
+		char new_insn[5] = { 0xB8, 0x01, 0x00, 0x00, 0x00 };
+		char old_insn[5] = { 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+		/* TODO: handle cases where there is just ret */
+		smp_text_poke_batch_add(prog->bpf_func + prog->jited_len - 
+				6 /* leave, jmp ret_thunk */ - 5 /* nop size */, new_insn, 5 /* mov eax, 1 */, old_insn);
+	}
+
 	smp_text_poke_batch_finish();
 }
 

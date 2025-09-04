@@ -11275,19 +11275,48 @@ static bool loop_flag_is_zero(struct bpf_verifier_env *env)
 static void update_loop_inline_state(struct bpf_verifier_env *env, u32 subprogno)
 {
 	struct bpf_loop_inline_state *state = &cur_aux(env)->loop_inline_state;
+	struct bpf_subprog_info *info = subprog_info(env, subprogno);
+
+	pr_info("update_loop_inline_state: subprogno arg %d\n", subprogno);
+	pr_info("update_loop_inline_state: state->initialized %d \n", state->initialized);
+	pr_info("update_loop_inline_state: state->fit_for_inline %d \n", state->fit_for_inline);
+	pr_info("update_loop_inline_state: state->callback_subprogno %d \n", state->callback_subprogno);
 
 	if (!state->initialized) {
 		state->initialized = 1;
 		state->fit_for_inline = loop_flag_is_zero(env);
 		state->callback_subprogno = subprogno;
+		if (!state->fit_for_inline)
+			info->is_bpf_loop_cb_non_inline = 1;
+		pr_info("update_loop_inline_state: after state->initialized check\n");
+		pr_info("update_loop_inline_state: subprogno arg %d\n", subprogno);
+		pr_info("update_loop_inline_state: state->initialized %d \n", state->initialized);
+		pr_info("update_loop_inline_state: state->fit_for_inline %d \n", state->fit_for_inline);
+		pr_info("update_loop_inline_state: state->callback_subprogno %d \n", state->callback_subprogno);
 		return;
 	}
 
-	if (!state->fit_for_inline)
+
+	if (!state->fit_for_inline) {
+		info->is_bpf_loop_cb_non_inline = 1;
 		return;
+	}
+
+	pr_info("update_loop_inline_state: after state->fit_for_inlinefit_for_inline  check\n");
+	pr_info("update_loop_inline_state: subprogno arg %d\n", subprogno);
+	pr_info("update_loop_inline_state: state->initialized %d \n", state->initialized);
+	pr_info("update_loop_inline_state: state->fit_for_inline %d \n", state->fit_for_inline);
+	pr_info("update_loop_inline_state: state->callback_subprogno %d \n", state->callback_subprogno);
 
 	state->fit_for_inline = (loop_flag_is_zero(env) &&
 				 state->callback_subprogno == subprogno);
+
+	if (state->callback_subprogno != subprogno) {
+		info->is_bpf_loop_cb_non_inline = 1;
+		/* Should become better programmer than this */
+		info = subprog_info(env, state->callback_subprogno);
+		info->is_bpf_loop_cb_non_inline = 1;
+	}
 }
 
 /* Returns whether or not the given map type can potentially elide
@@ -21551,6 +21580,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->func_info_cnt = prog->aux->func_info_cnt;
 		func[i]->aux->poke_tab = prog->aux->poke_tab;
 		func[i]->aux->size_poke_tab = prog->aux->size_poke_tab;
+		/* Will the subprog_info[i]->is_bpf_loop_cb_non_inline defaults to 0? */
+		func[i]->aux->is_bpf_loop_cb_non_inline = env->subprog_info[i].is_bpf_loop_cb_non_inline;
 
 		/* Updating termination aux states */
 		pr_info("jit_subprogs: updating termination_aux_states for subprog %d\n", i);
@@ -24625,6 +24656,8 @@ static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
 		pr_info("debug_bpf_prog: subprog[%d] - jited_len %d\n", 
 					subprog, prog->aux->func[subprog]->jited_len);
+		pr_info("debug_bpf_prog: subprog[%d] - is_bpf_loop_cb_non_inline: %d\n", 
+				subprog, prog->aux->func[subprog]->aux->is_bpf_loop_cb_non_inline);
 		for (int i = 0; i < prog->len; i++) {
 			pr_info("0x%02x\t0x%01x\t0x%01x\t0x%04x\t\t0x%08x\n",
 					prog->aux->func[subprog]->insnsi[i].code,

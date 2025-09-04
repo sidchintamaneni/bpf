@@ -1627,6 +1627,7 @@ struct bpf_prog_aux {
 	bool tail_call_reachable;
 	bool xdp_has_frags;
 	bool exception_cb;
+	bool is_bpf_loop_cb_non_inline; /* true if subprog is non-inlining callback */
 	bool exception_boundary;
 	bool is_extended; /* true if extended by freplace program */
 	bool jits_use_priv_stack;
