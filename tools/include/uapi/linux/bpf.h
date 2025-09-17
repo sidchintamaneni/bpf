@@ -974,6 +974,7 @@ enum bpf_cmd {
 	BPF_PROG_BIND_MAP,
 	BPF_TOKEN_CREATE,
 	BPF_PROG_STREAM_READ_BY_FD,
+	BPF_PROG_TERMINATE,
 	__MAX_BPF_CMD,
 };
 
@@ -1874,6 +1875,9 @@ union bpf_attr {
 		__u32		prog_fd;
 	} prog_stream_read;
 
+	struct { /* struct used by BPF_PROG_TERMINATE command */
+		__u32		prog_id;
+	} prog_terminate;
 } __attribute__((aligned(8)));
 
 /* The description below is an attempt at providing documentation to eBPF

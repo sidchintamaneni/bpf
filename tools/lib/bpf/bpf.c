@@ -1394,4 +1394,17 @@ int bpf_prog_stream_read(int prog_fd, __u32 stream_id, void *buf, __u32 buf_len,
 
 	err = sys_bpf(BPF_PROG_STREAM_READ_BY_FD, &attr, attr_sz);
 	return libbpf_err_errno(err);
+
+int bpf_prog_terminate(int prog_id)
+{
+	int fd;
+	union bpf_attr attr;
+	const size_t attr_sz = offsetofend(union bpf_attr, prog_terminate);
+
+	memset(&attr, 0, sizeof(attr));
+	attr.prog_terminate.prog_id = prog_id;
+
+	fd = sys_bpf(BPF_PROG_TERMINATE, &attr, attr_sz);
+
+	return libbpf_err_errno(fd);
 }

@@ -730,6 +730,15 @@ struct bpf_prog_stream_read_opts {
 LIBBPF_API int bpf_prog_stream_read(int prog_fd, __u32 stream_id, void *buf, __u32 buf_len,
 				    struct bpf_prog_stream_read_opts *opts);
 
+/**
+ * @brief **bpf_prog_terminate()** when provided with prog id and cpu id
+ * of the running prog, it terminated the running BPF program.
+ *
+ * @param BPF program file descriptor
+ * @cpu_id cpu id of the running program
+ */
+LIBBPF_API int bpf_prog_terminate(int prog_id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
