@@ -5987,6 +5987,28 @@ static int prog_stream_read(union bpf_attr *attr)
 	return ret;
 }
 
+static struct workqueue_struct *bpf_termination_wq;
+
+static int bpf_prog_terminate(union bpf_attr *attr)
+{
+	struct bpf_prog *prog;
+
+	prog = bpf_prog_by_id(attr->prog_id);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	if (atomic_cmpxchg(&prog->term_states->bpf_die_in_progress, 0, 1))
+		return -EBUSY;
+	
+	bpf_termination_wq = alloc_workqueue("bpf_termination_wq", WQ_UNBOUND, 1);
+	if (!bpf_termination_wq)
+		pr_err("Failed to alloc workqueue for bpf termination.\n");
+
+	queue_work(bpf_termination_wq, &prog->term_states->work);
+
+	return 0;
+}
+
 static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 {
 	union bpf_attr attr;
@@ -6125,6 +6147,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_PROG_STREAM_READ_BY_FD:
 		err = prog_stream_read(&attr);
+		break;
+	case BPF_PROG_TERMINATE:
+		err = bpf_prog_terminate(&attr);
 		break;
 	default:
 		err = -EINVAL;

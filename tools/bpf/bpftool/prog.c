@@ -2027,7 +2027,7 @@ static int do_terminate(int argc, char **argv)
 {
 	int prog_id;
 
-	if (!REQ_ARGS(3))
+	if (!REQ_ARGS(2))
 		return BAD_ARG();
 
 	if (!is_prefix(*argv, "id")) {
