@@ -1593,6 +1593,10 @@ struct call_aux_states {
 	u8 is_bpf_loop_cb_inline;
 };
 
+struct bpf_term_ctx {
+	bool deadlock;
+};
+
 struct bpf_term_patch_call_sites {
 	u32 call_sites_cnt;
 	struct call_aux_states *call_states;
