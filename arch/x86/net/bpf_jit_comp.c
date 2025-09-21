@@ -3866,14 +3866,16 @@ void in_place_patch_bpf_prog(struct bpf_prog *prog)
 	}
 	call_states = prog->term_states->patch_call_sites->call_states;
 	for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
-		
-		new_target = (unsigned long) bpf_termination_null_func;
 		if (call_states[i].is_bpf_loop_cb_inline) {
 			new_target = (unsigned long) bpf_loop_term_callback;	
+		} else if (call_states[i].is_helper_kfunc_ret_non_zero) {
+			new_target = (unsigned long) bpf_dummy_ret_non_zero;	
+		} else {
+			new_target = (unsigned long) bpf_termination_null_func;
 		}
 		char new_insn[5];
 
-		addr = (unsigned char *)prog->bpf_func + call_states->jit_call_idx;
+		addr = (unsigned char *)prog->bpf_func + call_states[i].jit_call_idx;
 
 		unsigned long new_rel = (unsigned long)(new_target - (unsigned long)(addr + 5));
 		new_insn[0] = 0xE8;
