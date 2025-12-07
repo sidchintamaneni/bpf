@@ -3982,9 +3982,14 @@ bool bpf_term_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	return false;
 }
 
+struct bpf_term_dummy {
+	u32 dummy;
+};
+
 void bpf_softlockup(u32 dur_s)
 {
-	arch_bpf_stack_walk(bpf_term_stack_walker, NULL);
+	struct bpf_term_dummy ctx = {};
+	arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 }
 
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
